@@ -1,0 +1,3035 @@
+#!/usr/bin/env python3
+"""Mansur 2024 postprocessed AC clock baseline, with retained legacy replay.
+
+Run: python offline_multi_gnss_combine_causal_balanced.py CONFIG.json
+Check equations: python offline_multi_gnss_combine_causal_balanced.py --self-test
+Inspect a failed run: python offline_multi_gnss_combine_causal_balanced.py --diagnose PATH_TO_quality.json
+Replay saved moments: python offline_multi_gnss_combine_causal_balanced.py --replay-vce PATH_TO_quality.json
+Dependency: NumPy. Delivered config selects pipeline=mansur2024, 300 s sampling.
+Delivered config uses unconstrained LS-VCE as the paper baseline.
+Set vce_constraint=nonnegative only for the explicitly labelled extension
+from Teunissen-Amiri-Simkooei2008 Sect3.6, not for an unmodified replication.
+No B2B, Huber, satellite/epoch quality multipliers, rolling calibration, variance
+floor, weight-ratio clipping, or silent equal-weight fallback in the baseline.
+CLK AS values are seconds; SP3 positions are km and clocks microseconds.
+Full-day data are used, including future epochs. This is not a real-time replay.
+COD REF is only evaluated after AC preprocessing/estimation. At least three ACs
+and adequate common core samples are required in each constellation.
+The exact reduced LSVCE normal equations follow Mansur2022 Eqs15,22,23, used by
+Mansur2024 Eqs15-18. Underdocumented numerical choices are in config/quality.json.
+Supplying combined_orbit_file uses an existing combined orbit; otherwise the
+separate supporting orbit module fits AC-wise Helmert parameters and estimates
+orbit variances. No original-day numerical results or PPP performance are claimed.
+For retained experimental functions select pipeline=legacy_causal explicitly.
+"""
+from __future__ import annotations
+import argparse, bisect, json, math, os, statistics, sys
+from collections import defaultdict
+from datetime import datetime, timezone, timedelta
+try:
+    import numpy as np
+except ImportError:
+    np = None
+
+C = 299792458.0
+R_EARTH = 6371000.0            # 地球平均半径 (m)，用于统一 Helmert 参数尺度
+GPS_EPOCH = datetime(1980, 1, 6, tzinfo=timezone.utc)
+LEAP_DATES = ["1981-07-01","1982-07-01","1983-07-01","1985-07-01","1988-01-01","1990-01-01","1991-01-01","1992-07-01","1993-07-01","1994-07-01","1996-01-01","1997-07-01","1999-01-01","2006-01-01","2009-01-01","2012-07-01","2015-07-01","2017-01-01"]
+
+def dt_parse(value):
+    if value.endswith("Z"): value = value[:-1] + "+00:00"
+    d = datetime.fromisoformat(value)
+    return d.replace(tzinfo=timezone.utc) if d.tzinfo is None else d.astimezone(timezone.utc)
+
+def utc_to_gpst(value):
+    d = dt_parse(value)
+    if d.year > 2026: raise ValueError("UTC/GPST leap table needs review beyond 2026")
+    return sec(d) + sum(d >= dt_parse(x) for x in LEAP_DATES)
+
+def sec(t): return (t - GPS_EPOCH).total_seconds()
+def utc_from_sec(x): return GPS_EPOCH + timedelta(seconds=x)
+def iso_sec(x): return utc_from_sec(x).strftime("%Y-%m-%dT%H:%M:%S")
+def gps_week_sec(t):
+    x = sec(t); return int(x // 604800), x % 604800
+def med(values): return statistics.median(list(values)) if values else None
+def mad(values, center=None):
+    if not values: return None
+    c = med(values) if center is None else center
+    return med([abs(x-c) for x in values])
+def finite(x): return x is not None and math.isfinite(float(x))
+
+def to_float(s):
+    """兼容 RINEX 里的 Fortran D 指数和 C E 指数。"""
+    return float(s.replace("D", "E").replace("d", "e"))
+
+def normalize_prn(raw):
+    raw = raw.strip()
+    return raw[1:] if raw.startswith("P") and len(raw) >= 3 and raw[1] in "GRECJ" else raw
+
+def lagrange(values, t, degree):
+    times = [x[0] for x in values]
+    if t in times: return values[times.index(t)][1]
+    k = min(degree + 1, len(values))
+    if k < 2: return None
+    i = bisect.bisect_left(times, t)
+    lo = max(0, min(i - k // 2, len(values) - k))
+    chosen = values[lo:lo+k]
+    sample = chosen[0][1]; width = len(sample) if isinstance(sample, tuple) else 1
+    result = []
+    for component in range(width):
+        total = 0.0
+        for j, (tj, vj) in enumerate(chosen):
+            term = vj[component] if width > 1 else vj
+            for m, (tm, _) in enumerate(chosen):
+                if m != j: term *= (t - tm) / (tj - tm)
+            total += term
+        result.append(total)
+    return tuple(result) if width > 1 else result[0]
+
+class Series:
+    def __init__(self): self.v = defaultdict(dict); self._times = {}
+    def add(self, prn, t, value): self.v[prn][t] = value; self._times.pop(prn, None)
+    def times(self, prn):
+        if prn not in self._times: self._times[prn] = sorted(self.v.get(prn, {}))
+        return self._times[prn]
+    def query(self, prn, t, max_gap, vector=False, degree=9, causal=False,
+              extrapolation_s=None):
+        a = self.times(prn)
+        if not a: return None, "missing"
+        if causal:
+            # A formal real-time query may use the current record and history only.
+            # Do not let the right-hand interpolation node or any later record
+            # influence the value at t.
+            available = bisect.bisect_right(a, t + 1e-6)
+            a = a[:available]
+            if not a: return None, "not_yet_available"
+        i = bisect.bisect_left(a, t)
+        if i < len(a) and abs(a[i]-t) < 1e-6: return self.v[prn][a[i]], "exact"
+        if i == 0:
+            return None, "outside"
+        if i == len(a):
+            if not causal:
+                return None, "outside"
+            age = t - a[-1]
+            limit = max_gap if extrapolation_s is None else float(extrapolation_s)
+            if age > limit + 1e-6:
+                return None, "expired"
+            # Causal extrapolation is deliberately bounded by the caller.
+            # The B2B policy uses degree=1, i.e. a two-node linear predictor.
+            if vector and len(a) < degree+1:
+                return None, "insufficient_nodes"
+            needed = degree+1 if vector else 2
+            if len(a) < needed:
+                return None, "insufficient_nodes"
+            local = a[-needed:]
+            if any(b-a > max_gap + 1e-6 for a,b in zip(local, local[1:])):
+                return None, "gap"
+            return lagrange([(x, self.v[prn][x]) for x in local], t, needed-1), "causal_extrap"
+        if a[i] - a[i-1] > max_gap + 1e-6: return None, "gap"
+        if vector and len(a) < degree+1: return None, "insufficient_nodes"
+        needed = degree+1 if vector else 2
+        if len(a) < needed: return None, "insufficient_nodes"
+        # In causal mode the local stencil is deliberately left-looking.
+        if causal:
+            local = a[-needed:]
+        else:
+            lo = max(0, min(i - needed//2, len(a)-needed))
+            local = a[lo:lo+needed]
+        if any(b-a > max_gap + 1e-6 for a,b in zip(local, local[1:])): return None, "gap"
+        return lagrange([(x, self.v[prn][x]) for x in local], t, needed-1), "interp"
+
+def epoch_to_gpst(t, time_system):
+    """Explicit epoch labels converted to GPST; missing metadata assumes GPS."""
+    code = str(time_system or "GPS").upper().strip()
+    if code in ("GPS", "GPST", "GAL", "GNSS_BROADCAST"): return t
+    if code == "UTC": return t + sum(utc_from_sec(t) >= dt_parse(x) for x in LEAP_DATES)
+    if code == "BDT": return t + 14.0
+    if code == "TAI": return t - 19.0
+    raise RuntimeError("unsupported epoch time system: " + code)
+
+
+class Product:
+    def __init__(self, name, sp3, clk, kind="AC", systems=("G",), options=None):
+        self.name, self.sp3_path, self.clk_path, self.kind = name, sp3, clk, kind
+        self.allowed_systems = set(systems); self.orb, self.clk = Series(), Series()
+        self.station_clk = Series()
+        self.options = dict(options or {}); self.rejected_orbits = 0
+        self.malformed_clock_records = 0
+        self.frames, self.systems = set(), set(); self.sp3_time_system = None; self.clk_time_system = None
+        self.orbit_type = None; self.clk_time_evidence = None; self.orb_times = []; self.clk_times = []; self._parse_sp3(); self._parse_clk()
+    def _parse_sp3(self):
+        t = None
+        with open(self.sp3_path, errors="replace") as f:
+            for line in f:
+                if line.startswith(("#a", "#b", "#c", "#d")) and len(line) >= 55:
+                    self.frames.add(line[46:51].strip()); self.orbit_type = line[52:55].strip()
+                if line.startswith("%c"):
+                    tokens = line.split()
+                    candidate=line[9:12].strip()
+                    if candidate in ("GPS", "UTC", "TAI", "BDT", "GAL", "GLO"): self.sp3_time_system=candidate
+                if line.startswith("*"):
+                    p = line[1:].split()
+                    if len(p) >= 6:
+                        try: t = epoch_to_gpst(sec(datetime(int(p[0]),int(p[1]),int(p[2]),int(p[3]),int(p[4]),tzinfo=timezone.utc) + timedelta(seconds=to_float(p[5]))), self.options.get("sp3_time_system_override") or self.sp3_time_system)
+                        except ValueError: t = None
+                elif t is not None and line.startswith("P"):
+                    p = line[1:].split()
+                    if len(p) >= 4:
+                        prn = normalize_prn(p[0])
+                        if prn and prn[0] in self.allowed_systems:
+                            try:
+                                xyz = tuple(to_float(x)*1000.0 for x in p[1:4]); radius = math.sqrt(sum(x*x for x in xyz))
+                                upper = float(self.options.get("radius_max_m_by_system", {}).get(prn[0], 3e7))
+                                if all(math.isfinite(x) and abs(x) < 9e7 for x in xyz) and 2e7 < radius < upper:
+                                    self.orb.add(prn, t, xyz); self.systems.add(prn[0])
+                                else: self.rejected_orbits += 1
+                            except ValueError: pass
+        self.orb_times = sorted({t for values in self.orb.v.values() for t in values})
+    def _parse_clk(self):
+        in_header = True
+        with open(self.clk_path, errors="replace") as f:
+            for line in f:
+                if in_header:
+                    upper = line.upper()
+                    if "TIME SYSTEM ID" in upper:
+                        value = line[:60].strip().upper()
+                        self.clk_time_system = value or None
+                        self.clk_time_evidence = "TIME SYSTEM ID: " + value
+                    elif "THE COMBINED CLOCKS ARE ALIGNED TO GPS TIME" in upper:
+                        self.clk_time_system = "GPS"
+                        self.clk_time_evidence = "header comment: " + line.strip()
+                    elif "ALIGNED TO BROADCAST GNSS TIME" in upper:
+                        self.clk_time_system = "GNSS_BROADCAST"
+                        self.clk_time_evidence = "header comment: " + line.strip()
+                    elif "OFFSET BETWEEN GNSS TIME SCALES" in upper:
+                        evidence = "header comment: " + line.strip()
+                        self.clk_time_evidence = ((self.clk_time_evidence + "; ") if self.clk_time_evidence else "") + evidence
+                if "END OF HEADER" in line: in_header = False; continue
+                if in_header or not line.startswith(("AS ", "AR ")): continue
+                p = line.split()
+                if len(p) < 10:
+                    self.malformed_clock_records += 1
+                    continue
+                station = p[0] == "AR"
+                prn = p[1].upper() if station else normalize_prn(p[1])
+                if not prn or (not station and prn[0] not in self.allowed_systems): continue
+                try:
+                    t = epoch_to_gpst(sec(datetime(int(p[2]),int(p[3]),int(p[4]),int(p[5]),int(p[6]),tzinfo=timezone.utc) + timedelta(seconds=to_float(p[7]))), self.options.get("clk_time_system_override") or self.clk_time_system)
+                    if int(p[8]) >= 1 and finite(to_float(p[9])):
+                        if station: self.station_clk.add(prn, t, to_float(p[9]))
+                        else: self.clk.add(prn, t, to_float(p[9])); self.systems.add(prn[0])
+                except (ValueError, IndexError): self.malformed_clock_records += 1
+        self.clk_times = sorted({t for values in self.clk.v.values() for t in values})
+    def report(self):
+        def stats(values):
+            ds = [b-a for a,b in zip(values, values[1:]) if b>a]
+            return {"start": iso_sec(values[0]) if values else None, "end": iso_sec(values[-1]) if values else None, "epochs": len(values), "min_dt": min(ds) if ds else None, "median_dt": med(ds), "max_dt": max(ds) if ds else None, "gaps_over_1s": sum(x>1 for x in ds)}
+        return {"name":self.name,"kind":self.kind,"sp3":self.sp3_path,"clk":self.clk_path,"frames":sorted(self.frames),"orbit_type":self.orbit_type,"sp3_time_system":self.sp3_time_system,"clk_time_system":self.clk_time_system,"clk_time_evidence":self.clk_time_evidence,"systems":sorted(self.systems),"orbit":stats(self.orb_times),"clock":stats(self.clk_times),"orbit_sats":len(self.orb.v),"clock_sats":len(self.clk.v),"station_clock_count":len(self.station_clk.v),"malformed_clock_records":self.malformed_clock_records}
+
+
+import warnings
+warnings.filterwarnings("ignore", category=RuntimeWarning)
+
+
+def parse_config(path):
+    with open(path, encoding="utf8") as f:
+        c = json.load(f)
+    for key in ("output_dir", "products"):
+        if key not in c:
+            raise ValueError("missing config key: " + key)
+    return c
+
+
+def json_safe(value):
+    """Recursively convert NumPy/non-finite values into strict JSON values."""
+    if isinstance(value, dict):
+        return {str(k): json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [json_safe(v) for v in value]
+    if np is not None and isinstance(value, np.ndarray):
+        return json_safe(value.tolist())
+    if np is not None and isinstance(value, np.integer):
+        return int(value)
+    if np is not None and isinstance(value, np.floating):
+        value = float(value)
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    return value
+
+
+def robust_ms(d, trim=0.02):
+    """Trimmed mean of squares (drops the largest `trim` fraction). Returns (value, n)."""
+    d = d[np.isfinite(d)]
+    if d.size == 0:
+        return None, 0
+    s = np.sort(d * d)
+    keep = s[: max(1, int(len(s) * (1.0 - trim)))]
+    return float(np.mean(keep)), int(d.size)
+
+
+def build_arrays(p, sats, grid, max_orb, max_clk, skip, causal=True,
+                 unavailable_window=None, audit=None, b2b_orbit_extrapolation_s=None,
+                 independent_clock_sampling=False):
+    """Sample formal products using available historical records only.
+
+    The record-epoch availability assumption is NOT actual reception latency. AC
+    records stamped inside unavailable_window are never received, including as
+    historical extrapolation nodes after recovery. B2B orbit queries use the
+    explicit short linear extrapolation policy when configured.
+    """
+    X = np.full((len(sats), len(grid), 3), np.nan)
+    K = np.full((len(sats), len(grid)), np.nan)
+    orb, clk = p.orb, p.clk
+    if causal and unavailable_window is not None:
+        orb, clk = Series(), Series()
+        t1, t2 = unavailable_window
+        for source, dest in ((p.orb, orb), (p.clk, clk)):
+            for prn, values in source.v.items():
+                for t, value in values.items():
+                    if not (t1 <= t < t2): dest.add(prn, t, value)
+    counts = {"orbit": defaultdict(int), "clock": defaultdict(int)}
+    ages = []
+    orbit_degree = 1 if (p.kind == "B2B" and b2b_orbit_extrapolation_s is not None) else 9
+    orbit_extrapolation_s = b2b_orbit_extrapolation_s if p.kind == "B2B" else None
+    for i, prn in enumerate(sats):
+        for j, t in enumerate(grid):
+            if skip[j]:
+                counts["orbit"]["network_unavailable"] += 1
+                counts["clock"]["network_unavailable"] += 1
+                continue
+            o, os = orb.query(prn, t, max_orb, True, degree=orbit_degree,
+                              causal=causal, extrapolation_s=orbit_extrapolation_s)
+            k, ks = clk.query(prn, t, max_clk, causal=causal)
+            counts["orbit"][os] += 1; counts["clock"][ks] += 1
+            if o is not None and k is not None and finite(k):
+                X[i, j] = o; K[i, j] = k
+            if independent_clock_sampling:
+                if o is not None: X[i,j] = o
+                if k is not None and finite(k): K[i,j] = k
+            if causal:
+                for series in (orb, clk):
+                    times = series.times(prn)
+                    n = bisect.bisect_right(times, t)
+                    if n: ages.append(float(t - times[n-1]))
+    if audit is not None:
+        audit.update({"formal": bool(causal), "independent_clock_sampling":bool(independent_clock_sampling), "status_counts": {k: dict(v) for k,v in counts.items()},
+                      "max_latest_record_age_s": max(ages) if ages else None,
+                      "age_limit_orbit_s": max_orb, "age_limit_clock_s": max_clk,
+                      "b2b_orbit_extrapolation_s": orbit_extrapolation_s,
+                      "b2b_orbit_extrapolation_degree": orbit_degree if p.kind == "B2B" else None,
+                      "outage_records_excluded_from_history": unavailable_window is not None})
+    return X, K
+
+def align_ac_clocks(Ks):
+    """Per-epoch common-offset removal between AC clocks (zero-mean datum over the ACs)."""
+    A = np.stack(Ks)
+    P, S, T = A.shape
+    off = np.zeros((P, T))
+    for _ in range(4):
+        B = A - off[:, None, :]
+        comb = np.nanmedian(B, axis=0)
+        D = A - comb[None]
+        cnt = np.sum(np.isfinite(D), axis=1)
+        off = np.nanmedian(D, axis=1)
+        off[cnt < 3] = np.nan
+        m = np.nanmean(off, axis=0)
+        off = off - m[None, :]
+        off = np.where(np.isfinite(off), off, 0.0)
+    return A - off[:, None, :], off
+
+
+def robust_line(x, y):
+    keep = np.ones(len(y), bool)
+    beta = np.zeros(2)
+    for _ in range(5):
+        A = np.column_stack([np.ones(len(x)), x])
+        beta = np.linalg.lstsq(A[keep], y[keep], rcond=None)[0]
+        r = y - A @ beta
+        sc = 1.4826 * (np.median(np.abs(r[keep])) or 1e-12)
+        new = np.abs(r) <= 3.5 * sc
+        if np.array_equal(new, keep):
+            break
+        keep = new
+    r = y - np.column_stack([np.ones(len(x)), x]) @ beta
+    return beta, float(np.median(np.abs(r[keep])))
+
+
+def pair_stats(arrs, kind):
+    N = len(arrs)
+    M, n = {}, {}
+    for i in range(N):
+        for j in range(i + 1, N):
+            if kind == "orb":
+                d = np.linalg.norm(arrs[i] - arrs[j], axis=-1)
+            else:
+                D = (arrs[i] - arrs[j]) * C
+                cnt = np.sum(np.isfinite(D), axis=0)
+                d = D - np.nanmedian(D, axis=0)[None, :]
+                d[:, cnt < 3] = np.nan
+            M[(i, j)], n[(i, j)] = robust_ms(d.ravel())
+    return M, n
+
+
+def hat_sigma2(M, n, N, floor2, min_n):
+    """Three-cornered-hat generalisation: solve s_i + s_j = M_ij by least squares."""
+    rows, y = [], []
+    for (i, j), m in M.items():
+        if m is not None and n[(i, j)] >= min_n:
+            r = np.zeros(N)
+            r[i] = r[j] = 1.0
+            rows.append(r)
+            y.append(m)
+    if len(rows) < N or np.linalg.matrix_rank(np.array(rows)) < N:
+        return None
+    s = np.linalg.lstsq(np.array(rows), np.array(y), rcond=None)[0]
+    return np.maximum(s, floor2)
+
+
+def constrained_isb(system_bias, systems, reference="G"):
+    """Express system offsets as constrained ISB relative to one reference system."""
+    raw = {str(k): float(v) for k, v in system_bias.items() if finite(v)}
+    ref = float(raw.get(reference, 0.0))
+    return {s: float(raw.get(s, 0.0) - ref) for s in sorted(systems) if s in raw or s == reference}
+
+
+def detect_common_clock_jumps(d, tarr, outside, threshold_m=1.0, min_fraction=0.6):
+    """Detect near-synchronous common AC/B2B clock jumps outside the outage."""
+    d = np.asarray(d, float); outside = np.asarray(outside, bool)
+    events = []
+    for j in range(1, d.shape[1]):
+        if not (outside[j] and outside[j-1]):
+            continue
+        delta = (d[:, j] - d[:, j-1]) * C
+        finite_delta = np.isfinite(delta)
+        if not finite_delta.any():
+            continue
+        common = float(np.nanmedian(delta[finite_delta]))
+        close = finite_delta & (np.abs(delta - common) <= max(0.05, 0.25 * abs(common)))
+        fraction = float(np.sum(close) / max(1, np.sum(finite_delta)))
+        if abs(common) >= threshold_m and fraction >= min_fraction:
+            events.append({"epoch": iso_sec(tarr[j]), "epoch_index": int(j),
+                           "jump_m": common, "satellites": int(np.sum(close)),
+                           "finite_satellites": int(np.sum(finite_delta)),
+                           "fraction": fraction})
+    return events
+
+
+def quality_factors(V, kind, floor2, min_support=3):
+    """Return bounded satellite and epoch quality multipliers from residuals.
+
+    The LSVCE product/system variance remains the primary variance model; these
+    factors only down/up-weight well-supported satellite and epoch residuals.
+    """
+    V = np.asarray(V, float)
+    P, S, T = V.shape[:3]
+    if kind == "orb":
+        center = np.nanmedian(V, axis=0)
+        R = np.linalg.norm(V - center[None], axis=-1)
+    else:
+        center = np.nanmedian(V, axis=0)
+        R = np.abs(V - center[None]) * C
+    var_ps = np.full((P, S), np.nan)
+    for p in range(P):
+        for s in range(S):
+            v = R[p, s]; v = v[np.isfinite(v)]
+            if v.size >= min_support:
+                var_ps[p, s] = max(float(floor2), float(np.mean(v * v)))
+    valid = np.isfinite(var_ps)
+    base = float(np.nanmedian(var_ps[valid])) if valid.any() else float(floor2)
+    sat_q = np.ones((P, S), float)
+    sat_q[valid] = np.clip(base / np.maximum(var_ps[valid], floor2), 0.25, 4.0)
+    var_t = np.full(T, np.nan)
+    for t in range(T):
+        v = R[:, :, t].ravel(); v = v[np.isfinite(v)]
+        if v.size >= min_support:
+            var_t[t] = max(float(floor2), float(np.mean(v * v)))
+    tv = np.isfinite(var_t)
+    epoch_q = np.ones(T, float)
+    tbase = float(np.nanmedian(var_t[tv])) if tv.any() else float(floor2)
+    epoch_q[tv] = np.clip(tbase / np.maximum(var_t[tv], floor2), 0.25, 4.0)
+    return sat_q, epoch_q, {"satellite_variance_m2": var_ps.tolist(),
+                            "satellite_quality_factor": sat_q.tolist(),
+                            "epoch_variance_m2": var_t.tolist(),
+                            "epoch_quality_factor": epoch_q.tolist(),
+                            "bounds": [0.25, 4.0]}
+
+
+def error_stats(values, hard_limit_m=None):
+    """Return auditable error statistics with optional physical sanity filtering.
+
+    ``rms_m`` is computed after rejecting non-finite values and values beyond
+    the configured physical sanity limit.  ``raw_rms_m`` remains available so
+    a bad sample cannot disappear silently from the report.
+    """
+    a = np.asarray(values, dtype=float).ravel()
+    a = a[np.isfinite(a)]
+    raw_n = int(a.size)
+    raw_rms = float(np.sqrt(np.mean(a * a))) if raw_n else None
+    if hard_limit_m is not None and math.isfinite(float(hard_limit_m)):
+        limit = abs(float(hard_limit_m))
+        keep = np.abs(a) <= limit
+    else:
+        limit = None
+        keep = np.ones(a.shape, dtype=bool)
+    clean = a[keep]
+    rejected = int(raw_n - clean.size)
+    out = {"samples": int(clean.size), "raw_samples": raw_n,
+           "rejected_samples": rejected,
+           "hard_limit_m": limit,
+           "raw_rms_m": raw_rms}
+    if clean.size:
+        out.update({"rms_m": float(np.sqrt(np.mean(clean * clean))),
+                    "median_abs_m": float(np.median(np.abs(clean))),
+                    "p95_abs_m": float(np.percentile(np.abs(clean), 95)),
+                    "max_abs_m": float(np.max(np.abs(clean)))})
+    else:
+        out.update({"rms_m": None, "median_abs_m": None,
+                    "p95_abs_m": None, "max_abs_m": None})
+    return out
+
+
+def rtn_diagnostics(Xref, Xtest, tarr, mask, orbit_limit_m=10.0):
+    """Summarize orbit errors in local R/T/N directions.
+
+    A finite-but-obviously-invalid coordinate residual must not dominate RMS.
+    The raw and filtered statistics are both reported; the default 10 m
+    limit is a sanity filter for precision-product comparison, not an
+    accuracy guarantee.
+    """
+    D = np.asarray(Xtest) - np.asarray(Xref)
+    vals = {k: [] for k in ("R", "T", "N")}
+    for i in range(D.shape[0]):
+        for j in range(1, D.shape[1]-1):
+            if not mask[j]: continue
+            r = Xref[i, j]
+            v = Xref[i, j+1] - Xref[i, j-1]
+            d = D[i, j]
+            if not (np.all(np.isfinite(r)) and np.all(np.isfinite(v)) and np.all(np.isfinite(d))):
+                continue
+            nr = np.linalg.norm(r); en = np.cross(r, v); nen = np.linalg.norm(en)
+            if not (np.isfinite(nr) and nr > 0 and np.isfinite(nen) and nen > 0): continue
+            er = r / nr; en = en / nen; et = np.cross(en, er)
+            vals["R"].append(float(np.dot(d, er)))
+            vals["T"].append(float(np.dot(d, et)))
+            vals["N"].append(float(np.dot(d, en)))
+    return {k: error_stats(v, hard_limit_m=orbit_limit_m) for k, v in vals.items()}
+
+
+def continuity_diagnostics(X, K, tarr, inside, X_outside=None, K_outside=None, X_inside=None, K_inside=None):
+    """Measure source-switch discontinuity at the same epoch.
+
+    A raw difference between t and t-30 s is dominated by normal satellite
+    motion (roughly 100 km).  It is not a continuity jump.  When source
+    solutions are supplied, compare AC and B2B at the same boundary epoch and
+    report the common finite satellites only.
+    """
+    ii = np.where(inside)[0]
+    if ii.size == 0:
+        return {"available": False}
+    j0, j1 = int(ii[0]), int(ii[-1])
+    out = {"available": True, "entry_epoch": iso_sec(tarr[j0]), "exit_epoch": iso_sec(tarr[j1]),
+           "definition": "same_epoch_source_switch; not adjacent_epoch_motion"}
+
+    def switch_boundary(A0, A1, j, orbit):
+        a0, a1 = A0[:, j], A1[:, j]
+        if orbit:
+            common = np.all(np.isfinite(a0), axis=1) & np.all(np.isfinite(a1), axis=1)
+            delta = np.linalg.norm(a1[common] - a0[common], axis=1)
+            finite0 = np.all(np.isfinite(a0), axis=1)
+            finite1 = np.all(np.isfinite(a1), axis=1)
+        else:
+            common = np.isfinite(a0) & np.isfinite(a1)
+            delta = np.abs(a1[common] - a0[common]) * C
+            finite0 = np.isfinite(a0); finite1 = np.isfinite(a1)
+        delta = np.asarray(delta, dtype=float); delta = delta[np.isfinite(delta)]
+        result = {"common_sats": int(np.sum(common)), "finite_outside": int(np.sum(finite0)),
+                  "finite_inside": int(np.sum(finite1)), "samples": int(delta.size),
+                  "rms_m": float(np.sqrt(np.mean(delta * delta))) if delta.size else None,
+                  "median_abs_m": float(np.median(delta)) if delta.size else None,
+                  "p95_abs_m": float(np.percentile(delta, 95)) if delta.size else None,
+                  "max_abs_m": float(np.max(delta)) if delta.size else None}
+        if delta.size:
+            ids = np.where(common)[0]
+            pairs = sorted(((float(v), int(i)) for i, v in zip(ids, delta)), reverse=True)
+            result["largest_jumps"] = [{"sat_index": i, "jump_m": v} for v, i in pairs[:10]]
+        return result
+
+    if X_outside is not None and X_inside is not None:
+        out["source_switch"] = {"orbit": {"entry": switch_boundary(X_outside, X_inside, j0, True),
+                                           "exit": switch_boundary(X_outside, X_inside, j1, True)},
+                                "clock": {"entry": switch_boundary(K_outside, K_inside, j0, False),
+                                           "exit": switch_boundary(K_outside, K_inside, j1, False)}}
+    else:
+        out["warning"] = "source solutions not supplied; switch discontinuity unavailable"
+
+    # The source-switch value above is deliberately the raw same-epoch AC/B2B
+    # mismatch. It must not be used to judge an exit fade. Report the actual
+    # formal solution after the recovery transition separately.
+    post = np.where((~inside) & (np.arange(len(tarr)) > j1))[0]
+    if post.size:
+        j2 = int(post[0])
+        def actual_exit(A, baseline, j_before, j_after, orbit):
+            a0, a1 = A[:, j_before], A[:, j_after]
+            # Adjacent XYZ coordinates include the satellite's real orbital
+            # motion (tens of km per 30 s).  For a source-transition metric,
+            # remove the same adjacent-epoch motion of the AC baseline.
+            b0, b1 = baseline[:, j_before], baseline[:, j_after]
+            if orbit:
+                common = (np.all(np.isfinite(a0), axis=1) & np.all(np.isfinite(a1), axis=1) &
+                          np.all(np.isfinite(b0), axis=1) & np.all(np.isfinite(b1), axis=1))
+                delta = np.linalg.norm((a1[common] - a0[common]) - (b1[common] - b0[common]), axis=1)
+            else:
+                common = (np.isfinite(a0) & np.isfinite(a1) & np.isfinite(b0) & np.isfinite(b1))
+                delta = np.abs((a1[common] - a0[common]) - (b1[common] - b0[common])) * C
+            delta = np.asarray(delta, dtype=float); delta = delta[np.isfinite(delta)]
+            return {"from_epoch": iso_sec(tarr[j_before]), "to_epoch": iso_sec(tarr[j_after]),
+                    "samples": int(delta.size),
+                    "rms_m": float(np.sqrt(np.mean(delta * delta))) if delta.size else None,
+                    "median_abs_m": float(np.median(delta)) if delta.size else None,
+                    "p95_abs_m": float(np.percentile(delta, 95)) if delta.size else None,
+                    "max_abs_m": float(np.max(delta)) if delta.size else None,
+                    "definition": "formal adjacent change minus AC baseline adjacent change"}
+        out["formal_output_exit_step"] = {"orbit": actual_exit(X, X_outside, j1, j2, True),
+                                           "clock": actual_exit(K, K_outside, j1, j2, False),
+                                           "interpretation": "transition-induced change after removing normal AC motion"}
+    return out
+
+
+def combine(vals, sig2, kind, k=3.0, iters=3, sat_quality=None, epoch_quality=None, audit=None):
+    """Weighted mean with LSVCE variances and bounded quality multipliers."""
+    V = np.stack(vals)
+    sig = np.asarray(sig2, float)
+    w0 = np.divide(1.0, sig, out=np.zeros_like(sig, dtype=float), where=np.isfinite(sig) & (sig > 0))
+    fin = np.isfinite(V[..., 0]) if kind == "orb" else np.isfinite(V)
+    if w0.ndim == 1:
+        W = w0[:, None, None] * fin
+    elif w0.ndim == 2:
+        W = w0[:, :, None] * fin
+    else:
+        raise ValueError("sig2 must have shape (products,) or (products, satellites)")
+    if sat_quality is not None:
+        W = W * np.asarray(sat_quality)[:, :, None]
+    if epoch_quality is not None:
+        W = W * np.asarray(epoch_quality)[None, None, :]
+    h = np.ones(fin.shape)
+
+    def wmean(W):
+        den = W.sum(0)
+        Vz = np.where(fin[..., None], V, 0.0) if kind == "orb" else np.where(fin, V, 0.0)
+        num = (Vz * W[..., None]).sum(0) if kind == "orb" else (Vz * W).sum(0)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            return (num / den[..., None] if kind == "orb" else num / den), den
+
+    comb, den = wmean(W)
+    safe_sigma = np.where(np.isfinite(sig) & (sig > 0), sig, np.inf)
+    thr = k * np.sqrt(safe_sigma)[:, None, None] if sig.ndim == 1 else k * np.sqrt(safe_sigma)[:, :, None]
+    for _ in range(iters):
+        r = np.linalg.norm(V - comb[None], axis=-1) if kind == "orb" else np.abs(V - comb[None]) * C
+        with np.errstate(invalid="ignore", divide="ignore"):
+            h = np.where(r > thr, thr / r, 1.0)
+        h = np.where(np.isfinite(h), h, 1.0)
+        comb, den = wmean(W * h)
+    if audit is not None:
+        base_den=W.sum(0)
+        effective=W*h
+        audit.update({"available":fin.copy(),"huber_factor":h.copy(),
+                      "available_normalized_weight":np.divide(W,base_den[None],out=np.zeros_like(W),where=base_den[None]>0),
+                      "effective_normalized_weight":np.divide(effective,den[None],out=np.zeros_like(effective),where=den[None]>0)})
+    return comb, den
+
+
+def helmert_design(r):
+    """Linearized 7-parameter Helmert design for y-x = t + w x r + s*r."""
+    x, y, z = np.asarray(r, float) / R_EARTH
+    return np.array([[1.0, 0.0, 0.0, 0.0, z, -y, x],
+                     [0.0, 1.0, 0.0, -z, 0.0, x, y],
+                     [0.0, 0.0, 1.0, y, -x, 0.0, z]], dtype=float)
+
+
+def helmert_fit_epoch(xb, ya, robust_limit=3.5):
+    """Fit one epoch's B2B->AC frame transform from satellite coordinates.
+
+    返回的 theta 中：
+      theta[0:3] 平移 (m)
+      theta[3:6] 旋转 (rad)
+      theta[6]   尺度 (1)
+    """
+    rows, obs = [], []
+    for r_b, r_a in zip(xb, ya):
+        if np.all(np.isfinite(r_b)) and np.all(np.isfinite(r_a)):
+            rows.append(helmert_design(r_b))
+            obs.append((np.asarray(r_a) - np.asarray(r_b)) / R_EARTH)
+    if len(rows) < 3:
+        return None, None, 0
+    A = np.vstack(rows); y = np.concatenate(obs)
+    if np.linalg.matrix_rank(A) < 7: return None, None, 0
+    keep = np.ones(y.size, dtype=bool)
+    theta = np.zeros(7)
+    for _ in range(4):
+        theta = np.linalg.lstsq(A[keep], y[keep], rcond=None)[0]
+        res = y - A @ theta
+        scale = 1.4826 * (np.median(np.abs(res[keep])) or 1e-6)
+        new = np.abs(res) <= robust_limit * scale
+        if new.sum() < 3 * 3 or np.array_equal(new, keep):
+            break
+        keep = new
+    res = y - A @ theta
+    rms = float(np.sqrt(np.mean(res[keep] ** 2)) * R_EARTH) if keep.any() else None
+    theta[0:3] *= R_EARTH
+    return theta, rms, int(keep.sum() // 3)
+
+
+def transform_helmert(r, theta):
+    """Apply small-angle Helmert parameters [m, rad, scale] to XYZ metres."""
+    if theta is None or not np.all(np.isfinite(r)):
+        return r
+    r = np.asarray(r, float)
+    t = theta[:3]; w = theta[3:6]; s = theta[6]
+    return r + t + np.cross(w, r) + s * r
+
+
+def orbit_sanity_mask(pos, previous=None, dt=None, radius_min_m=2.0e7,
+                      radius_max_m=3.0e7, max_speed_mps=12000.0):
+    """Return per-satellite validity for transformed GNSS orbit coordinates."""
+    pos = np.asarray(pos, float)
+    good = np.all(np.isfinite(pos), axis=-1)
+    radius = np.linalg.norm(pos, axis=-1)
+    good &= np.isfinite(radius) & (radius >= float(radius_min_m)) & (radius <= float(radius_max_m))
+    if previous is not None and dt is not None and float(dt) > 0:
+        previous = np.asarray(previous, float)
+        both = good & np.all(np.isfinite(previous), axis=-1)
+        speed = np.full(good.shape, np.nan)
+        speed[both] = np.linalg.norm(pos[both] - previous[both], axis=-1) / float(dt)
+        good &= (~both) | (speed <= float(max_speed_mps))
+    return good
+
+
+def helmert_parameters_plausible(theta, rms, max_translation_m=100.0,
+                                 max_rotation_rad=1.0e-5,
+                                 max_abs_scale=1.0e-6,
+                                 max_residual_m=10.0):
+    """Hard safety gate for a frame update before it enters the Kalman state."""
+    if theta is None or not np.all(np.isfinite(theta)):
+        return False, "nonfinite_parameters"
+    if rms is None or not finite(rms) or float(rms) > float(max_residual_m):
+        return False, "residual_limit"
+    if np.linalg.norm(theta[:3]) > float(max_translation_m):
+        return False, "translation_limit"
+    if np.linalg.norm(theta[3:6]) > float(max_rotation_rad):
+        return False, "rotation_limit"
+    if abs(float(theta[6])) > float(max_abs_scale):
+        return False, "scale_limit"
+    return True, "accepted"
+
+
+def transform_b2b_kalman(Xac, Xb, sats, tarr, outside, q_diag=None, r_floor=1e-4,
+                         sanity=None, recovery_transition_s=0.0):
+    """Sequential Helmert filter in uniformly scaled metre units.
+
+    u=[translations_m, rotations_rad*R_EARTH, scale*R_EARTH].
+    Observation covariance uses the LS geometry, not identical variances for
+    translation metres and rotation radians. q is physical variance per nominal
+    epoch and is scaled by actual elapsed time; no initialization from future.
+    Uninitialized products are unavailable (NaN), not raw IGb20 tagged IGS20.
+    """
+    S,T,_ = Xb.shape
+    scale = np.array([1.,1.,1.,R_EARTH,R_EARTH,R_EARTH,R_EARTH])
+    q = np.asarray(q_diag if q_diag is not None else [1e-4]*3+[1e-16]*4, float)
+    if q.shape != (7,) or not np.all(np.isfinite(q)) or np.any(q<0):
+        raise ValueError("helmert_kalman_q requires seven finite non-negative variances")
+    u = None; P = None; initial = None
+    out = np.full_like(Xb, np.nan); history = []; residuals=[]
+    previous_output = np.full((S, 3), np.nan)
+    reject_counts = defaultdict(int); rejected_satellites = 0
+    sanity = dict(sanity or {})
+    radius_min_m = float(sanity.get("radius_min_m", 2.0e7))
+    radius_max_m = float(sanity.get("radius_max_m", 3.0e7))
+    max_speed_mps = float(sanity.get("max_speed_mps", 12000.0))
+    max_translation_m = float(sanity.get("max_translation_m", 100.0))
+    max_rotation_rad = float(sanity.get("max_rotation_rad", 1.0e-5))
+    max_abs_scale = float(sanity.get("max_abs_scale", 1.0e-6))
+    max_residual_m = float(sanity.get("max_residual_m", 10.0))
+    nominal_dt = float(tarr[1]-tarr[0]) if T>1 else 30.
+    updates = 0
+    recovery_anchor = None; recovery_start = None
+    if not math.isfinite(recovery_transition_s) or recovery_transition_s < 0:
+        raise ValueError("invalid Helmert recovery transition")
+    for j,t in enumerate(tarr):
+        if j and outside[j] and not outside[j-1] and u is not None:
+            recovery_anchor = u.copy(); recovery_start = float(t)
+        status = "UNINITIALIZED"
+        if u is not None and j:
+            P = P + np.diag(q*scale**2)*max(0.,float(t-tarr[j-1]))/nominal_dt
+            status = "PREDICTED"
+        if outside[j]:
+            ref = np.nanmedian(np.stack([a[:,j] for a in Xac]),axis=0)
+            raw_good = np.all(np.isfinite(Xb[:,j]),axis=1)&np.all(np.isfinite(ref),axis=1)
+            orbit_good = orbit_sanity_mask(Xb[:,j], previous_output, nominal_dt if j else None,
+                                            radius_min_m, radius_max_m, max_speed_mps)
+            good = raw_good & orbit_good
+            rejected_satellites += int(np.sum(raw_good & ~orbit_good))
+            theta, rms, n = helmert_fit_epoch(Xb[good,j],ref[good]) if np.sum(good) >= 3 else (None,None,0)
+            if theta is None:
+                reject_counts["insufficient_orbit_observations"] += 1
+            else:
+                accepted, reason = helmert_parameters_plausible(
+                    theta, rms, max_translation_m, max_rotation_rad, max_abs_scale, max_residual_m)
+                if not accepted:
+                    reject_counts[reason] += 1
+                else:
+                    H = np.vstack([helmert_design(r) for r in Xb[good,j]])
+                    if np.linalg.matrix_rank(H)==7:
+                        R = max(float(rms or r_floor)**2,r_floor**2)*np.linalg.pinv(H.T@H)
+                        z = theta*scale
+                        if u is None:
+                            u = z.copy(); P=R.copy(); initial=j
+                        else:
+                            gain = np.linalg.solve((P+R).T,P.T).T
+                            u += gain@(z-u)
+                            I=np.eye(7)-gain
+                            P=I@P@I.T+gain@R@gain.T
+                            P=(P+P.T)*0.5
+                        updates+=1; residuals.append(rms); status="UPDATED"
+                    else:
+                        reject_counts["rank_deficient"] += 1
+        if u is not None:
+            recovery_alpha = 1.0
+            if recovery_anchor is not None and recovery_transition_s > 0:
+                recovery_alpha = min(1.0, max(0.0, (float(t)-recovery_start)/recovery_transition_s))
+            applied_u = u if recovery_anchor is None else (1.-recovery_alpha)*recovery_anchor + recovery_alpha*u
+            theta=applied_u/scale
+            candidate = np.full((S,3), np.nan)
+            for i in range(S):
+                if np.all(np.isfinite(Xb[i,j])): candidate[i]=transform_helmert(Xb[i,j],theta)
+            valid = orbit_sanity_mask(candidate, previous_output, nominal_dt if j else None,
+                                      radius_min_m, radius_max_m, max_speed_mps)
+            rejected_satellites += int(np.sum(np.all(np.isfinite(candidate),axis=1) & ~valid))
+            out[valid,j]=candidate[valid]
+            previous_output = np.full((S, 3), np.nan)
+            previous_output[valid] = candidate[valid]
+        history.append({"epoch":iso_sec(t),"status":status,
+                        "parameters":(u/scale).tolist() if u is not None else None,
+                        "applied_parameters":theta.tolist() if u is not None else None,
+                        "recovery_alpha":recovery_alpha if u is not None else None,
+                        "covariance_diagonal_physical":(np.diag(P)/scale**2).tolist() if P is not None else None})
+    return out, {"method":"causal_7state_random_walk_kalman",
+                 "initialized":u is not None,"initialized_epoch":initial,
+                 "epoch_parameter_count":updates,"epoch_parameter_count_outside":updates,
+                 "rejected_update_counts":dict(reject_counts),
+                 "rejected_satellite_records":int(rejected_satellites),
+                 "orbit_sanity_limits":{"radius_min_m":radius_min_m,"radius_max_m":radius_max_m,
+                                         "max_speed_mps":max_speed_mps},
+                 "helmert_sanity_limits":{"max_translation_m":max_translation_m,
+                                           "max_rotation_rad":max_rotation_rad,
+                                           "max_abs_scale":max_abs_scale,
+                                           "max_residual_m":max_residual_m},
+                 "propagation_epochs_inside":int(np.sum(~outside)),
+                 "uses_ac_observations_inside_window":False,"future_ac_used_for_initialization":False,
+                 "parameters_units":["m","m","m","rad","rad","rad","1"],
+                 "internal_state_units":"all metres via Earth-radius scaling",
+                 "q_units":"physical parameter variance per nominal epoch",
+                 "transform_residual_rms_m_median":float(np.median(residuals)) if residuals else None,
+                 "transform_residual_rms_m_p95":float(np.percentile(residuals,95)) if residuals else None,
+                 "final_parameters":(u/scale).tolist() if u is not None else None,
+                 "recovery_transition_seconds":float(recovery_transition_s),
+                 "recovery_policy":"blend_pre_recovery_state_to_current_filtered_state",
+                 "history":history}
+
+def bridge_to_b2b(pred_source, b2b_solution, tarr, outside, inside, transition_s=300.0, linear=True):
+    """Blend a last-known AC prediction into B2B at outage entry.
+
+    The source is extrapolated only from epochs before the outage; no AC sample
+    inside the outage is read.  After the configured transition interval the
+    result is pure B2B.  This models a receiver temporarily losing the network
+    while retaining its last state estimate, rather than making a hard switch.
+    """
+    out = np.array(b2b_solution, copy=True)
+    if not np.any(inside) or transition_s <= 0:
+        return out, {"enabled": False, "reason": "no_inside_or_zero_transition"}
+    ii = np.where(inside)[0]
+    start = int(ii[0])
+    prev = np.where(outside & (np.arange(len(tarr)) < start))[0]
+    if prev.size == 0:
+        return out, {"enabled": False, "reason": "no_pre_outage_state"}
+    j1 = int(prev[-1])
+    j0 = int(prev[-2]) if prev.size > 1 else j1
+    dt = float(tarr[j1] - tarr[j0]) if j1 != j0 else 0.0
+    # Last-state constant hold is the safe fallback; linear extrapolation is
+    # used only where two finite pre-outage states exist.
+    source = np.array(pred_source[:, j1], copy=True)
+    if j0 != j1 and linear:
+        slope = (pred_source[:, j1] - pred_source[:, j0]) / dt
+        finite_slope = np.isfinite(slope) & np.isfinite(source)
+    else:
+        slope = np.zeros_like(source)
+        finite_slope = np.zeros_like(source, dtype=bool)
+    used = 0
+    for j in ii:
+        age = float(tarr[j] - tarr[start])
+        alpha = min(1.0, max(0.0, age / float(transition_s)))
+        pred = source.copy()
+        if np.any(finite_slope):
+            pred[finite_slope] = source[finite_slope] + slope[finite_slope] * (tarr[j] - tarr[j1])
+        if pred.ndim == 1:
+            good = np.isfinite(pred) & np.isfinite(out[:, j])
+            out[good, j] = (1.0 - alpha) * pred[good] + alpha * out[good, j]
+        else:
+            good = np.all(np.isfinite(pred), axis=-1) & np.all(np.isfinite(out[:, j]), axis=-1)
+            out[good, j] = (1.0 - alpha) * pred[good] + alpha * out[good, j]
+        used += 1
+    return out, {"enabled": True, "transition_seconds": float(transition_s),
+                  "start_epoch": int(start), "pre_outage_epoch": int(j1),
+                  "epochs_blended": int(used), "linear_prediction": bool(linear),
+                  "uses_ac_observations_inside_window": False}
+
+
+def recovery_residual_fade(formal, b2b, recovered, tarr, inside, transition_s):
+    """Anchor the residual at first recovery using same-epoch products.
+
+    The recovered AC+B2B candidate is only used from the first epoch after the
+    outage.  The first recovery output is anchored to the B2B solution and then
+    fades its residual to the recovered candidate over ``transition_s``.
+    """
+    out = np.array(formal, copy=True)
+    if transition_s<=0 or not np.any(inside):
+        return out,{"enabled":False,"reason":"zero_transition_or_no_outage"}
+    last = int(np.where(inside)[0][-1])
+    post = np.where((~inside)&(np.arange(len(tarr))>last))[0]
+    if not post.size: return out,{"enabled":False,"reason":"no_recovery_in_replay"}
+    start=int(post[0]); offset=b2b[:,start]-recovered[:,start]
+    good = np.all(np.isfinite(offset),axis=-1) if offset.ndim==2 else np.isfinite(offset)
+    used = 0
+    for j in post:
+        alpha=min(1.,max(0.,float(tarr[j]-tarr[start])/transition_s))
+        now=np.all(np.isfinite(recovered[:,j]),axis=-1) if offset.ndim==2 else np.isfinite(recovered[:,j])
+        use=good&now
+        if np.any(use):
+            out[use,j]=recovered[use,j]+(1.-alpha)*offset[use]
+            used += 1
+        if alpha>=1.: break
+    return out,{"enabled":True,"transition_seconds":float(transition_s),
+                "start_epoch":start,"start_time":iso_sec(tarr[start]),
+                "anchor_satellites":int(np.sum(good)),"epochs_blended":int(used),
+                "space":"same_epoch_recovery_residual",
+                "uses_ac_observations_inside_window":False}
+
+
+def bridge_b2b_to_ac(b2b_solution, ac_solution, tarr, inside, transition_s=300.):
+    formal=np.where(inside[None,:,None] if b2b_solution.ndim==3 else inside[None,:],b2b_solution,ac_solution)
+    return recovery_residual_fade(formal,b2b_solution,ac_solution,tarr,inside,transition_s)
+
+
+bridge_b2b_to_ac_residual = bridge_b2b_to_ac
+
+def estimate_b2b_clock_corrections(Kac_med, Kb_raw, sats, tarr, outside, cfg):
+    """Causal rolling raw-difference calibration with confirmed jump resets.
+
+    Histories store AC-B2B seconds, never residuals under obsolete states.
+    Pending jump samples are quarantined; confirmation seeds a new segment
+    without rewriting any earlier output. Outages freeze states and reset
+    confirmation counters. A jump is a relative product change, not proof
+    that B2B rather than AC is at fault.
+    """
+    from collections import deque
+    d = np.asarray(Kac_med, float) - np.asarray(Kb_raw, float)
+    tarr = np.asarray(tarr, float); outside = np.asarray(outside, bool)
+    S, T = d.shape
+    if d.shape != np.asarray(Kb_raw).shape or S != len(sats) or T != len(tarr) or outside.shape != (T,):
+        raise ValueError("invalid clock calibration array shapes")
+    if T > 1 and np.any(np.diff(tarr) <= 0):
+        raise ValueError("clock epochs must be strictly increasing")
+    window = float(cfg.get("b2b_clock_history_window_s", cfg.get("b2b_clock_segment_s", 1800.)))
+    threshold = float(cfg.get("b2b_clock_jump_threshold_m", 1.0))
+    sat_threshold = float(cfg.get("b2b_clock_sat_jump_threshold_m", threshold))
+    fraction = float(cfg.get("clock_jump_min_fraction", .6))
+    confirm = int(cfg.get("b2b_clock_jump_confirm_epochs", 3))
+    tolerance = float(cfg.get("b2b_clock_jump_consistency_m", .25))
+    min_sats = int(cfg.get("b2b_clock_min_sats", 3))
+    min_bias = int(cfg.get("min_bias_samples", 30))
+    floor_m = float(cfg.get("clock_sigma_floor_m", .05))
+    outlier_k = float(cfg.get("b2b_clock_outlier_sigma", 5.))
+    if not all(math.isfinite(v) and v > 0 for v in (window, threshold, sat_threshold, tolerance, floor_m, outlier_k)):
+        raise ValueError("clock window/threshold/scale settings must be positive and finite")
+    if min_sats < 2 or min_bias < 1 or confirm < 1 or not (.5 < fraction <= 1):
+        raise ValueError("invalid jump support or confirmation settings")
+    groups = {sc: np.array([i for i,s in enumerate(sats) if s[0] == sc], int)
+              for sc in sorted(set(s[0] for s in sats))}
+    history = [deque() for _ in sats]
+    pending_system = {}; pending_sat = {}
+    common = 0.; system = {sc: 0. for sc in groups}
+    satellite = np.zeros(S); ready = np.zeros(S, bool)
+    correction = np.zeros((S,T)); common_by_epoch = []
+    events = []; states = []; rejected = np.zeros(S, int)
+    total_samples = np.zeros(S, int); segment = np.zeros(S, int)
+    ever_calibrated = np.zeros(S, bool)
+    jump_seed = np.zeros(S, bool)
+    last_observation = np.full(S, np.nan); last_calibration = np.full(S, np.nan)
+    applied = np.zeros(S); recovery_anchor = None; recovery_start = None
+    recovery_s = float(cfg.get("clock_calibration_recovery_transition_s", cfg.get("recovery_transition_s", 300.)))
+    if not math.isfinite(recovery_s) or recovery_s < 0:
+        raise ValueError("invalid clock calibration recovery transition")
+
+    def baseline(i):
+        return float(np.median([v for _,v in history[i]])) if history[i] else np.nan
+
+    def advance(table, key, delta_m, samples):
+        previous = table.get(key)
+        consistent = (previous is not None and delta_m * previous["delta_m"] > 0
+                      and abs(delta_m - previous["delta_m"]) <= tolerance)
+        if consistent:
+            previous["count"] += 1; previous["samples"].extend(samples)
+            previous["delta_m"] = delta_m
+        else:
+            table[key] = {"count": 1, "delta_m": delta_m, "samples": list(samples), "start": j}
+        return table[key]
+
+    for j,t in enumerate(tarr):
+        if j and outside[j] and not outside[j-1]:
+            recovery_anchor = applied.copy(); recovery_start = float(t)
+        if not outside[j]:
+            pending_system.clear(); pending_sat.clear()
+        else:
+            for i,h in enumerate(history):
+                while h and h[0][0] < t - window: h.popleft()
+                if not h: jump_seed[i] = False
+            ready[:] = False
+            current = d[:,j]
+            base = np.array([baseline(i) for i in range(S)])
+            delta = (current - base) * C
+            blocked = set()
+            for sc, idx in groups.items():
+                supported = idx[np.isfinite(delta[idx])]
+                jump = False
+                if len(supported) >= min_sats:
+                    step = float(np.median(delta[supported]))
+                    coherent = np.abs(delta[supported] - step) <= tolerance
+                    jump = abs(step) >= threshold and np.mean(coherent) >= fraction
+                if not jump:
+                    pending_system.pop(sc, None)
+                    continue
+                samples = [(int(i), float(t), float(current[i])) for i in idx if np.isfinite(current[i])]
+                p = advance(pending_system, sc, step, samples)
+                blocked.update(idx.tolist())
+                for i in idx: pending_sat.pop(int(i), None)
+                if p["count"] >= confirm:
+                    # Only this system is reset; other systems retain histories.
+                    for i in idx:
+                        history[i].clear(); segment[i] += 1
+                        jump_seed[i] = True
+                        satellite[i] = 0.; ready[i] = False
+                    for i,tt,v in p["samples"]:
+                        history[i].append((tt,v)); total_samples[i] += 1
+                        last_observation[i] = tt
+                    events.append({"scope":"system", "system":sc,
+                                   "detected_start":iso_sec(tarr[p["start"]]),
+                                   "confirmed_epoch":iso_sec(t), "jump_m":step,
+                                   "support_satellites":len(supported),
+                                   "action":"reset_system_raw_history"})
+                    pending_system.pop(sc, None)
+
+            for i in range(S):
+                if i in blocked: continue
+                if not np.isfinite(current[i]):
+                    pending_sat.pop(i, None); continue
+                jump = np.isfinite(delta[i]) and abs(delta[i]) >= sat_threshold
+                if jump:
+                    p = advance(pending_sat, i, float(delta[i]), [(i,float(t),float(current[i]))])
+                    if p["count"] >= confirm:
+                        history[i].clear(); segment[i] += 1; satellite[i] = 0.; ready[i] = False
+                        jump_seed[i] = True
+                        for _,tt,v in p["samples"]:
+                            history[i].append((tt,v)); total_samples[i] += 1
+                            last_observation[i] = tt
+                        events.append({"scope":"satellite", "satellite":sats[i],
+                                       "detected_start":iso_sec(tarr[p["start"]]),
+                                       "confirmed_epoch":iso_sec(t), "jump_m":float(delta[i]),
+                                       "action":"reset_satellite_raw_history"})
+                        pending_sat.pop(i, None)
+                    continue
+                pending_sat.pop(i, None)
+                # Reject isolated sub-threshold outliers; jump candidates bypass
+                # this gate and are handled by the confirmation path above.
+                values = np.array([v for _,v in history[i]])
+                if len(values) >= min_bias:
+                    center = float(np.median(values))
+                    scale_m = max(floor_m, 1.4826 * float(np.median(np.abs(values-center))) * C)
+                    if abs(current[i]-center)*C > outlier_k*scale_m:
+                        rejected[i] += 1; continue
+                history[i].append((float(t),float(current[i]))); total_samples[i] += 1
+                last_observation[i] = float(t)
+
+            # Refit all three layers from raw values in the same current window.
+            # Equal system weighting avoids changes in satellite counts moving
+            # the common datum. Insufficient groups keep their last total state.
+            centers = {}; valid_idx = {}
+            for sc,idx in groups.items():
+                use = [int(i) for i in idx if history[i]]
+                if len(use) >= min_sats:
+                    centers[sc] = float(np.median([baseline(i) for i in use])); valid_idx[sc] = use
+            if centers:
+                previous_totals = {sc:common+system[sc] for sc in groups}
+                common = float(np.median(list(centers.values())))
+                for sc in groups:
+                    system[sc] = centers.get(sc, previous_totals[sc]) - common
+                    if sc not in centers: continue
+                    for i in valid_idx[sc]:
+                        if len(history[i]) >= (confirm if jump_seed[i] else min_bias):
+                            satellite[i] = baseline(i) - centers[sc]; ready[i] = True
+                            ever_calibrated[i] = True
+                            if last_observation[i] == float(t): last_calibration[i] = float(t)
+                        else:
+                            satellite[i] = 0.; ready[i] = False
+        target = np.array([common + system[s[0]] + (satellite[i] if ready[i] else 0.)
+                           for i,s in enumerate(sats)])
+        alpha = 1.0
+        if outside[j]:
+            if recovery_anchor is not None and recovery_s > 0:
+                alpha = min(1., max(0., (float(t)-recovery_start)/recovery_s))
+            applied = target if recovery_anchor is None else (1.-alpha)*recovery_anchor + alpha*target
+        correction[:,j] = applied
+        statuses = []
+        for i in range(S):
+            if not np.isfinite(last_observation[i]): status = "NO_DATA"
+            elif not outside[j]: status = "HOLD_OUTAGE" if ever_calibrated[i] else "HOLD_UNCALIBRATED"
+            elif ready[i]: status = "CALIBRATED"
+            elif not history[i]: status = "STALE"
+            else: status = "WARMUP"
+            statuses.append(status)
+        common_by_epoch.append(float(common*C))
+        states.append({"epoch_index":j, "outside":bool(outside[j]),
+                       "common_bias_m":float(common*C),
+                       "system_bias_m":{sc:float(v*C) if any(np.isfinite(last_observation[i]) for i in groups[sc]) else None for sc,v in system.items()},
+                       "window_samples":sum(sum(tt>=t-window for tt,_ in h) for h in history),
+                       "retained_history_samples":sum(len(h) for h in history),
+                       "calibrated_satellites":statuses.count("CALIBRATED"),
+                       "status_counts":{status:statuses.count(status) for status in sorted(set(statuses))},
+                       "satellite_status":statuses,
+                       "observation_age_s":[float(t-v) if np.isfinite(v) else None for v in last_observation],
+                       "calibration_age_s":[float(t-v) if np.isfinite(v) else None for v in last_calibration],
+                       "recovery_alpha":alpha if outside[j] else None,
+                       "pending_systems":sorted(pending_system),
+                       "pending_satellites":[sats[i] for i in sorted(pending_sat)]})
+    variances = {}
+    for i,h in enumerate(history):
+        if len(h) >= 3:
+            values = np.array([v for _,v in h]); residual = (values-np.median(values))*C
+            variances[sats[i]] = max(floor_m**2, float(np.mean(residual**2)))
+    audit_events = detect_common_clock_jumps(d,tarr,outside,threshold_m=threshold,min_fraction=fraction)
+    diag = {"method":"causal_rolling_raw_difference_with_confirmed_jump_reset",
+            "history_window_seconds":window, "segments_used":int(segment.sum()),
+            "segments_definition":"confirmed satellite history resets; system reset counts each satellite",
+            "common_offset_m":common_by_epoch, "jump_threshold_m":threshold,
+            "jump_confirm_epochs":confirm, "jump_count":len(events), "jumps":events,
+            "common_epoch_jump_events":audit_events,
+            "system_bias_m":{sc:float(v*C) if any(np.isfinite(last_observation[i]) for i in groups[sc]) else None for sc,v in system.items()},
+            "isb_m_relative_to_GPS":{sc:(float((system[sc]-system['G'])*C) if 'G' in groups and any(np.isfinite(last_observation[i]) for i in groups['G']) and any(np.isfinite(last_observation[i]) for i in groups[sc]) else None) for sc in groups},
+            "isb_reference_system":"G", "sat_bias_m":{s:float(satellite[i]*C) if ready[i] else None for i,s in enumerate(sats)},
+            "sat_bias_samples":{s:len(history[i]) for i,s in enumerate(sats)},
+            "sat_total_accepted_samples":{s:int(total_samples[i]) for i,s in enumerate(sats)},
+            "sat_outlier_count":{s:int(rejected[i]) for i,s in enumerate(sats)},
+            "satellite_residual_variance_m2":variances,
+            "robust_model":{"method":"rolling_median_MAD_gate", "min_bias_samples":min_bias, "min_satellites":min_sats},
+            "state_epochs":states, "uses_ac_observations_inside_window":False, "future_ac_used":False,
+            "satellite_status_order":list(sats),
+            "recovery_transition_seconds":recovery_s,
+            "final_applied_correction_m":{s:float(applied[i]*C) if np.isfinite(last_observation[i]) else None for i,s in enumerate(sats)},
+            "uncalibrated_satellites":[s for i,s in enumerate(sats) if not ready[i]],
+            "jump_interpretation":"relative AC-minus-B2B change; source of fault not identified",
+            "sat_trend_m_per_day":{s:None for s in sats}}
+    return Kb_raw + correction, diag
+
+
+def lsvce_sigma2(arrs, kind, floor2, min_n, max_ratio=10.0,
+                  iterations=30, relative_tol=1e-3):
+    """Estimate independent product variance components with an auditable
+    residual iteration.  The residual variance is corrected for the product's
+    weighted-mean leverage (1-h_i), and convergence is based on the maximum
+    relative variance-component change rather than a fixed iteration count.
+    Returns ``(sigma2, audit)``."""
+    V = np.stack(arrs); P = V.shape[0]
+    active = np.array([np.isfinite(a).any() for a in V], dtype=bool)
+    sig2 = np.full(P, np.nan, dtype=float)
+    sig2[active] = max(float(floor2), 1.0)
+    history = []
+    converged = False
+    iterations_used = 0
+    for it in range(int(max(1, iterations))):
+        old = sig2.copy()
+        inv = np.where(np.isfinite(sig2) & (sig2 > 0), 1.0 / sig2, 0.0)
+        if kind == "orb":
+            fin = np.all(np.isfinite(V), axis=-1)
+            W = inv[:, None, None] * fin
+            den = W.sum(0)
+            num = (np.where(fin[..., None], V, 0.0) * W[..., None]).sum(0)
+            comb = np.divide(num, den[..., None], out=np.full_like(num, np.nan), where=den[..., None] > 0)
+            sample_counts = np.zeros(P, dtype=int)
+            for i in range(P):
+                d = V[i] - comb
+                good = np.all(np.isfinite(d), axis=-1)
+                vals = d[good]
+                sample_counts[i] = int(vals.shape[0] * 3)
+                if vals.shape[0] * 3 >= min_n:
+                    # h_i is the leverage of product i at each epoch/satellite.
+                    h = np.divide(W[i], den, out=np.zeros_like(den), where=den > 0)[good]
+                    denom = np.maximum(1.0 - h, 0.05)
+                    sig2[i] = max(float(floor2), float(np.mean(vals * vals / denom[:, None])))
+        else:
+            fin = np.isfinite(V)
+            W = inv[:, None, None] * fin
+            den = W.sum(0)
+            num = (np.where(fin, V, 0.0) * W).sum(0)
+            comb = np.divide(num, den, out=np.full_like(num, np.nan), where=den > 0)
+            sample_counts = np.zeros(P, dtype=int)
+            for i in range(P):
+                residual = V[i] - comb
+                good = np.isfinite(residual)
+                vals = residual[good] * C
+                sample_counts[i] = int(vals.size)
+                if vals.size >= min_n:
+                    h = np.divide(W[i], den, out=np.zeros_like(den), where=den > 0)[good]
+                    sig2[i] = max(float(floor2), float(np.mean(vals * vals / np.maximum(1.0 - h, 0.05))))
+        active_vals = sig2[active]
+        if active_vals.size:
+            lo = max(float(floor2), float(np.nanmin(active_vals)))
+            sig2[active] = np.clip(active_vals, lo, lo * max_ratio)
+        rel = np.zeros(P, dtype=float)
+        changed = active & np.isfinite(old) & np.isfinite(sig2)
+        rel[changed] = np.abs(sig2[changed] - old[changed]) / np.maximum(old[changed], float(floor2))
+        max_rel = float(np.max(rel[changed])) if np.any(changed) else 0.0
+        history.append({"iteration": it + 1, "max_relative_variance_change": max_rel,
+                        "sigma2": [float(x) if np.isfinite(x) else None for x in sig2],
+                        "sample_counts": sample_counts.tolist()})
+        iterations_used = it + 1
+        if max_rel <= float(relative_tol):
+            converged = True
+            break
+    tail = [h["max_relative_variance_change"] for h in history[-6:]]
+    decreasing = len(tail) >= 3 and all(b < a for a,b in zip(tail,tail[1:]))
+    contraction = tail[-1]/tail[-2] if len(tail)>1 and tail[-2]>0 else None
+    reason = "CONVERGED" if converged else ("SLOW_CONVERGENCE_ITERATION_LIMIT" if decreasing else "ITERATION_LIMIT_UNRESOLVED")
+    additional = None
+    if not converged and contraction is not None and 0 < contraction < 1 and relative_tol > 0:
+        additional = int(max(0, math.ceil(math.log(relative_tol/tail[-1])/math.log(contraction))))
+    audit = {"method": "residual_lsvce_with_leverage_correction",
+             "iterations_requested": int(iterations), "iterations_used": iterations_used,
+             "relative_tol": float(relative_tol), "converged": bool(converged),
+             "history": history,
+             "convergence_diagnosis":{"reason":reason, "final_relative_change":tail[-1] if tail else None,
+                                      "tail_strictly_decreasing":decreasing, "tail_contraction_ratio":contraction,
+                                      "estimated_additional_iterations":additional,
+                                      "estimate_is_extrapolation_not_guarantee":True}}
+    return sig2, audit
+
+
+def radial_clock_mapping(source_orbit, common_orbit, source_clock, max_correction_m=10.):
+    """Chen (2022) eq. 2/8, DX=0: K_corrected = K - radial/c.
+
+    Does not replace antenna/attitude corrections. Missing geometry leaves
+    the original clock explicitly marked unmapped, preserving CLK coverage.
+    """
+    radius=np.linalg.norm(source_orbit,axis=-1)
+    good=np.all(np.isfinite(source_orbit),axis=-1)&np.all(np.isfinite(common_orbit),axis=-1)&np.isfinite(source_clock)&(radius>0)
+    delta=np.full(source_clock.shape,np.nan)
+    delta[good]=np.sum(source_orbit[good]*(source_orbit[good]-common_orbit[good]),axis=-1)/radius[good]
+    rejected=good&(np.abs(delta)>max_correction_m)
+    good &= ~rejected
+    corrected=np.array(source_clock,copy=True);corrected[good]-=delta[good]/C
+    return corrected,{"definition":"subtract source radial displacement relative to common orbit divided by c; DX=0",
+                      "mapped_clock_records":int(good.sum()),"unmapped_finite_clock_records":int((np.isfinite(source_clock)&~good).sum()),
+                      "rejected_large_corrections":int(rejected.sum()),"radial_correction_m":error_stats(delta[good]),
+                      "missing_geometry_policy":"keep_original_clock_and_report_unmapped",
+                      "antenna_attitude_correction":"not_implemented"}
+
+
+def ac_relative_bias_correction(clocks,names,sats,tarr,cfg):
+    """Relative satellite bias, not PPP-derived physical ASB. REF is never used."""
+    from collections import deque
+    reference=cfg.get("ac_bias_reference","WUM")
+    if reference not in names:raise ValueError("ac_bias_reference must name a participating AC")
+    r=names.index(reference);mode=cfg.get("ac_bias_mode","none")
+    if mode not in ("relative_rolling","relative_daily"):raise ValueError("invalid relative AC bias mode")
+    if mode=="relative_daily" and cfg.get("strict_no_future_nodes",True):raise ValueError("daily relative bias uses full-day data; forbidden in strict causal mode")
+    window=float(cfg.get("ac_bias_window_s",1800.));minimum=int(cfg.get("ac_bias_min_samples",30))
+    threshold=float(cfg.get("ac_bias_jump_threshold_m",1.));confirm=int(cfg.get("ac_bias_jump_confirm_epochs",3))
+    if window<=0 or minimum<1 or threshold<=0 or confirm<1:raise ValueError("invalid AC relative bias settings")
+    result=np.array(clocks,copy=True);audit={}
+    groups={sc:np.array([i for i,s in enumerate(sats) if s[0]==sc]) for sc in sorted(set(s[0] for s in sats))}
+    for p,name in enumerate(names):
+        if p==r:continue
+        D=clocks[r]-clocks[p]
+        # Remove per-system common datum before estimating satellite terms.
+        for idx in groups.values():
+            center=np.nanmedian(D[idx],axis=0);center[np.isfinite(D[idx]).sum(axis=0)<3]=np.nan
+            D[idx]-=center[None,:]
+        histories=[deque() for _ in sats];pending={};ready=np.zeros(len(sats),bool)
+        applied=np.zeros(len(sats));events=[];resets=np.zeros(len(sats),int)
+        if mode=="relative_daily":
+            for i in range(len(sats)):
+                values=D[i,np.isfinite(D[i])]
+                if len(values)>=minimum:applied[i]=float(np.median(values));ready[i]=True
+            result[p]+=np.where(ready,applied,0.)[:,None]
+        else:
+            for j,t in enumerate(tarr):
+                for i,h in enumerate(histories):
+                    while h and h[0][0]<t-window:h.popleft()
+                    v=D[i,j];blocked=False
+                    if np.isfinite(v) and len(h)>=minimum:
+                        step=(v-np.median([x for _,x in h]))*C
+                        if abs(step)>=threshold:
+                            old=pending.get(i)
+                            if old and step*old['step']>0 and abs(step-old['step'])<=.25:
+                                old['values'].append((float(t),float(v)));old['step']=float(step)
+                            else:pending[i]={'values':[(float(t),float(v))],'step':float(step)}
+                            blocked=True
+                            if len(pending[i]['values'])>=confirm:
+                                h.clear();h.extend(pending[i]['values']);resets[i]+=1
+                                events.append({'satellite':sats[i],'epoch':iso_sec(t),'jump_m':float(step),'action':'reset_relative_bias_history'})
+                                pending.pop(i,None)
+                        else:pending.pop(i,None)
+                    elif not np.isfinite(v):pending.pop(i,None)
+                    if np.isfinite(v) and not blocked:h.append((float(t),float(v)))
+                    ready[i]=len(h)>=minimum
+                    if ready[i]:applied[i]=float(np.median([x for _,x in h]))
+                result[p,:,j]+=np.where(ready,applied,0.)
+        audit[name]={'method':mode,'reference_ac':reference,'physical_ASB_estimated':False,
+                     'uses_future_data':mode=='relative_daily','jump_events':events,
+                     'final_ready_satellites':[s for i,s in enumerate(sats) if ready[i]],
+                     'final_unestimated_satellites':[s for i,s in enumerate(sats) if not ready[i]],
+                     'final_added_bias_m':{s:float(applied[i]*C) if ready[i] else None for i,s in enumerate(sats)}}
+    return result,audit
+
+
+def apply_external_asb(clocks,names,sats,tarr,cfg):
+    data=cfg.get("ac_asb")
+    if not isinstance(data,dict) or data.get("convention")!="add_to_clock_seconds":
+        raise ValueError("ac_asb requires convention=add_to_clock_seconds and add_to_clock_seconds table")
+    if not data.get("source") or not data.get("calibration_end"):
+        raise ValueError("external ASB requires source and calibration_end (GPST)")
+    end=sec(dt_parse(data['calibration_end']));strict=cfg.get('strict_no_future_nodes',True)
+    allowed=tarr>=end if strict else np.ones(len(tarr),bool)
+    result=np.array(clocks,copy=True);count=0
+    for p,name in enumerate(names):
+        for i,s in enumerate(sats):
+            value=data.get('add_to_clock_seconds',{}).get(name,{}).get(s)
+            if value is None:continue
+            if not finite(value):raise ValueError('nonfinite external ASB')
+            result[p,i,allowed]+=float(value);count+=1
+    return result,{'method':'external_ASB_table','source':data['source'],'calibration_end':data['calibration_end'],
+                   'corrected_ac_satellite_pairs':count,'applied_before_calibration_end':not strict,
+                   'physical_ASB_estimated_in_this_program':False}
+
+
+def residual_rms_sigma2(arrs,times,floor2,min_n,max_ratio=10.,iterations=3):
+    """Chen-inspired eq.13/14 residual RMS weights, with historical linear datum fit.
+
+    This weight module alone is not a full Chen reproduction. No REF is used.
+    """
+    V=np.stack(arrs);P=V.shape[0];fin=np.isfinite(V);active=fin.any(axis=(1,2))
+    sig=np.where(active,1.,np.nan);history=[];counts=fin.sum(axis=(1,2))
+    x=(np.asarray(times,float)-float(times[-1]))/3600.;design=np.stack([np.ones(len(x)),x],axis=1)
+    for it in range(max(1,int(iterations))):
+        inv=np.divide(1.,sig,out=np.zeros_like(sig),where=np.isfinite(sig)&(sig>0))
+        W=inv[:,None,None]*fin;den=W.sum(0)
+        mean=np.divide((np.where(fin,V,0.)*W).sum(0),den,out=np.full(den.shape,np.nan),where=den>0)
+        aligned=V.copy();parameters=[]
+        for p in range(P):
+            residual=mean-V[p];good=np.isfinite(residual);jj=np.where(good)[1]
+            if good.sum()<min_n:parameters.append(None);continue
+            A=design[jj];y=residual[good]*C
+            beta=np.linalg.lstsq(A,y,rcond=None)[0]
+            aligned[p]+= (design@beta)[None,:]/C
+            parameters.append(beta.tolist())
+        # Residual weights are computed against the current combined estimate.
+        old=sig.copy()
+        for p in range(P):
+            residual=(aligned[p]-mean)*C;values=residual[np.isfinite(residual)]
+            if len(values)>=min_n:sig[p]=max(floor2,float(np.mean(values*values)))
+        if active.any():
+            lo=max(floor2,float(np.nanmin(sig[active])));sig[active]=np.clip(sig[active],lo,lo*max_ratio)
+        history.append({'iteration':it+1,'sigma2':sig.tolist(),'linear_datum_parameters_m_m_per_hour':parameters,
+                        'max_relative_variance_change':float(np.nanmax(np.abs(sig-old)/np.maximum(old,floor2)))})
+    usable=active.any() and np.all(np.isfinite(sig[active])) and all(counts[p]>=min_n for p in np.flatnonzero(active))
+    return sig,{'method':'historical_aligned_residual_RMS_inverse_square','usable':bool(usable),
+                'iterations_used':len(history),'history':history,'future_used':False,
+                'full_Chen_reproduction':False}
+
+
+def eval_vs(refX, refK, cX, cK, mask, orbit_limit_m=10.0):
+    if mask.sum() == 0:
+        return None
+    # Orbit coordinates are expected to agree at the metre-to-kilometre scale;
+    # a larger value indicates an invalid/misaligned sample rather than a useful
+    # precision statistic. Keep it in raw_rms/outlier counts, but exclude it
+    # from the reported quality RMS.
+    orbit_d = cX[:, mask] - refX[:, mask]
+    ro = np.linalg.norm(orbit_d, axis=-1).ravel()
+    D = (cK[:, mask] - refK[:, mask]) * C
+    cnt = np.sum(np.isfinite(D), axis=0)
+    with np.errstate(invalid="ignore"):
+        D = D - np.nanmedian(D, axis=0)[None, :]
+    D[:, cnt < 3] = np.nan
+    rc = D.ravel()
+    out = error_stats(ro, hard_limit_m=orbit_limit_m)
+    out = {"orbit_samples": out["samples"],
+           "orbit_raw_samples": out["raw_samples"],
+           "orbit_rejected_samples": out["rejected_samples"],
+           "orbit_hard_limit_m": out["hard_limit_m"],
+           "orbit_raw_rms_m": out["raw_rms_m"],
+           "orbit_rms_m": out["rms_m"],
+           "orbit_median_m": out["median_abs_m"],
+           "orbit_p95_m": out["p95_abs_m"]}
+    clk = error_stats(rc, hard_limit_m=1.0e6)
+    out.update({"clock_samples": clk["samples"],
+                "clock_raw_samples": clk["raw_samples"],
+                "clock_rejected_samples": clk["rejected_samples"],
+                "clock_hard_limit_m": clk["hard_limit_m"],
+                "clock_raw_rms_m": clk["raw_rms_m"],
+                "clock_rms_m": clk["rms_m"],
+                "clock_median_abs_m": clk["median_abs_m"],
+                "clock_p95_abs_m": clk["p95_abs_m"]})
+    return out
+
+
+def clock_evaluation_by_system(refK, testK, sats, mask, min_sats=3):
+    """Diagnostics only: separate each system's datum and satellite residuals.
+
+    Ref is an independent comparison product, not error-free truth. Keep raw
+    differences and epoch common offsets as well as centered residuals.
+    """
+    mask = np.asarray(mask, bool)
+    result = {"units":"metres_equivalent_range", "definition":"test_minus_reference; per_system_per_epoch_median_datum",
+              "minimum_common_satellites_per_epoch":int(min_sats), "epochs_selected":int(mask.sum()), "systems":{}}
+    for sc in sorted(set(s[0] for s in sats)):
+        idx = np.array([i for i,s in enumerate(sats) if s[0]==sc], int)
+        D = (testK[idx][:,mask]-refK[idx][:,mask])*C
+        counts = np.isfinite(D).sum(axis=0)
+        offset = np.nanmedian(D,axis=0)
+        offset[counts<min_sats] = np.nan
+        residual = D-offset[None,:]
+        epoch_indices = np.flatnonzero(mask)
+        per_sat = {}
+        for k,i in enumerate(idx):
+            raw = D[k]; rv=residual[k]; raw=raw[np.isfinite(raw)];rv=rv[np.isfinite(rv)]
+            per_sat[sats[i]] = {"raw_samples":int(raw.size), "raw_bias_m":float(np.mean(raw)) if raw.size else None,
+                               "raw_std_m":float(np.std(raw)) if raw.size else None,
+                               "datum_removed_samples":int(rv.size),
+                               "datum_removed_bias_m":float(np.mean(rv)) if rv.size else None,
+                               "datum_removed_std_m":float(np.std(rv)) if rv.size else None,
+                               "datum_removed_rms_m":float(np.sqrt(np.mean(rv*rv))) if rv.size else None}
+        result["systems"][sc] = {"raw_difference":error_stats(D),
+                                 "common_offset":error_stats(offset),
+                                 "datum_removed_residual":error_stats(residual),
+                                 "epochs_with_sufficient_support":int(np.sum(counts>=min_sats)),
+                                 "epoch_indices":epoch_indices.tolist(),
+                                 "common_satellites_per_epoch":counts.tolist(),
+                                 "common_offset_m":offset.tolist(), "satellites":per_sat}
+    return result
+
+
+def sequential_fusion(names, orbit, clock, sats, tarr, outside, cfg, audit_label=None):
+    """Each epoch has its own weights estimated from its historical window.
+
+    LSVCE is estimated only from jointly observed >=2-product residuals.
+    Non-convergence/insufficient samples keeps prior accepted variances, or
+    fixed conservative defaults. Never silently accept final failed iteration.
+    No retrospective quality_factors are allowed into formal generation.
+    """
+    P,S,T=len(names),len(sats),len(tarr)
+    fo=float(cfg.get("orbit_sigma_floor_m",.01))**2
+    fk=float(cfg.get("clock_sigma_floor_m",.05))**2
+    so=np.full((P,S),max(fo,float(cfg.get("fallback_orbit_sigma_m",1.))**2))
+    sk=np.full((P,S),max(fk,float(cfg.get("fallback_clock_sigma_m",1.))**2))
+    X=np.full((S,T,3),np.nan); K=np.full((S,T),np.nan)
+    window=float(cfg.get("weight_history_window_s",3600.))
+    cadence=float(cfg.get("weight_update_interval_s",300.))
+    minn=int(cfg.get("min_pair_samples",200))
+    if window<=0 or cadence<=0 or minn<1: raise ValueError("invalid causal weighting settings")
+    next_update=float(tarr[0]); snapshots=[]; epochs=[]
+    indices={sys:np.array([i for i,s in enumerate(sats) if s.startswith(sys)],int) for sys in sorted(set(s[0] for s in sats))}
+    weights_file=None;weights_writer=None;weights_path=None;weight_summary={};normalization_error=0.
+    variance_status={};variance_accepted={}
+    if cfg.get("export_effective_weights",False) and audit_label:
+        import csv
+        os.makedirs(cfg["output_dir"],exist_ok=True)
+        weights_path=os.path.join(cfg["output_dir"],"effective_weights_"+audit_label+".csv")
+        weights_file=open(weights_path,"w",newline="",encoding="utf-8-sig")
+        weights_writer=csv.writer(weights_file)
+        weights_writer.writerow(["epoch_gpst","kind","system","satellite","product","sigma2_m2","available","available_normalized_weight","huber_factor","effective_normalized_weight","last_variance_update_status","variance_origin","outage_hold"])
+    for j,t in enumerate(tarr):
+        if outside[j] and t>=next_update:
+            mask=(tarr[:j+1]>=t-window)&outside[:j+1]
+            snap={"epoch":iso_sec(t),"latest_history_epoch":iso_sec(t),"systems":{}}
+            for sys,idx in indices.items():
+                sd={}
+                for kind,arrs,variances,floor in (("orbit",orbit,so,fo),("clock",clock,sk,fk)):
+                    vals=[a[idx,:j+1,:][:,mask,:] if kind=="orbit" else a[idx,:j+1][:,mask] for a in arrs]
+                    V=np.stack(vals)
+                    finite=np.all(np.isfinite(V),axis=-1) if kind=="orbit" else np.isfinite(V)
+                    joint=finite.sum(axis=0)>=2
+                    vals=[np.where(joint[...,None] if kind=="orbit" else joint,v,np.nan) for v in vals]
+                    active=np.array([np.isfinite(v).any() for v in vals])
+                    counts=[int(np.sum(np.all(np.isfinite(v),axis=-1) if kind=="orbit" else np.isfinite(v))) for v in vals]
+                    audit=None; status="FALLBACK_INSUFFICIENT_SAMPLES"
+                    # Count satellite-epochs conservatively for both product types.
+                    if np.sum(active)>=2 and all(counts[i]>=minn for i in np.where(active)[0]):
+                        iteration_budget = int(cfg.get("lsvce_max_iterations",30))
+                        configured_ac = {p["name"] for p in cfg.get("products",[]) if p.get("kind","AC").upper()=="AC"}
+                        if sys=="G" and kind=="clock" and all(n in configured_ac for n in names):
+                            iteration_budget = int(cfg.get("lsvce_gps_ac_only_clock_max_iterations", iteration_budget))
+                        weight_method=cfg.get("clock_weight_method","lsvce") if kind=="clock" else "lsvce"
+                        if weight_method=="residual_rms":
+                            sig,audit=residual_rms_sigma2(vals,tarr[:j+1][mask],floor,minn,
+                                float(cfg.get("max_weight_ratio",10.)),int(cfg.get("residual_weight_iterations",3)))
+                            accepted=audit["usable"]
+                        elif weight_method=="lsvce":
+                            sig,audit=lsvce_sigma2(vals,"orb" if kind=="orbit" else "clk",floor,minn,
+                                float(cfg.get("max_weight_ratio",10.)),iteration_budget,
+                                float(cfg.get("lsvce_relative_tol",1e-3)))
+                            accepted=audit["converged"]
+                        else:raise ValueError("clock_weight_method must be lsvce or residual_rms")
+                        if accepted and np.all(np.isfinite(sig[active])) and np.all(sig[active]>0):
+                            fallback_sigma=float(cfg.get("fallback_%s_sigma_m" % ("orbit" if kind=="orbit" else "clock"),1.0))
+                            max_sigma2=max(floor,fallback_sigma**2)*float(cfg.get("max_weight_ratio",10.0))
+                            clipped=np.minimum(sig[active],max_sigma2)
+                            variances[np.ix_(np.where(active)[0],idx)]=clipped[:,None]
+                            method_label="RESIDUAL_RMS" if weight_method=="residual_rms" else "LSVCE"
+                            status="ACCEPTED_"+method_label+("_CLIPPED" if np.any(sig[active]>max_sigma2) else "")
+                        else: status="FALLBACK_NON_CONVERGED"
+                    fallback_sigma=float(cfg.get("fallback_%s_sigma_m" % ("orbit" if kind=="orbit" else "clock"),1.0))
+                    variance_cap=max(floor,fallback_sigma**2)*float(cfg.get("max_weight_ratio",10.0))
+                    estimator=cfg.get("clock_weight_method","lsvce") if kind=="clock" else "lsvce"
+                    sd[kind]={"status":status,"sample_counts":counts,"lsvce":audit if estimator=="lsvce" else None,
+                              "variance_estimator":estimator,"estimation_audit":audit,
+                              "sigma2":variances[:,idx[0]].tolist(),"variance_cap_m2":variance_cap}
+                    inverse=1./variances[:,idx[0]]
+                    sd[kind]["normalized_base_weights"]=(inverse/inverse.sum()).tolist()
+                    sd[kind]["weight_definition"]="inverse variance before availability masking and Huber; not independent reference accuracy"
+                    variance_status[(kind,sys)]=status
+                    if status.startswith("ACCEPTED"):
+                        for p in np.flatnonzero(active):variance_accepted[(kind,sys,int(p))]=True
+                snap["systems"][sys]=sd
+            snapshots.append(snap); next_update=float(t)+cadence
+        # Computation below is epoch-local, so next epoch cannot alter outputs.
+        xa={} if weights_writer else None;ka={} if weights_writer else None
+        x,_=combine([a[:,j:j+1] for a in orbit],so,"orb",audit=xa)
+        k,_=combine([a[:,j:j+1] for a in clock],sk,"clk",audit=ka)
+        if weights_writer:
+            for kind,variances,audit in (("orbit",so,xa),("clock",sk,ka)):
+                supported=audit["available"].any(axis=0)
+                if supported.any():
+                    error=np.max(np.abs(audit["effective_normalized_weight"].sum(axis=0)[supported]-1.))
+                    normalization_error=max(normalization_error,float(error))
+                for i,sat in enumerate(sats):
+                    if not audit["available"][:,i,0].any():continue
+                    for p,name in enumerate(names):
+                        available=bool(audit["available"][p,i,0]);effective=float(audit["effective_normalized_weight"][p,i,0])
+                        weights_writer.writerow([iso_sec(t),kind,sat[0],sat,name,float(variances[p,i]),int(available),
+                                                 float(audit["available_normalized_weight"][p,i,0]),float(audit["huber_factor"][p,i,0]),effective,
+                                                 variance_status.get((kind,sat[0]),"INITIAL_DEFAULT"),
+                                                 "accepted_current_or_previous_variance" if variance_accepted.get((kind,sat[0],p),False) else "conservative_default",
+                                                 int(not outside[j])])
+                        key=kind+":"+sat[0]+":"+name
+                        acc=weight_summary.setdefault(key,{"supported_satellite_epochs":0,"effective_weight_sum":0.,"available_satellite_epochs":0})
+                        acc["supported_satellite_epochs"]+=1;acc["available_satellite_epochs"]+=int(available);acc["effective_weight_sum"]+=effective
+        X[:,j]=x[:,0]; K[:,j]=k[:,0]
+        epochs.append({"epoch":iso_sec(t),"status":"HOLD_OUTAGE" if not outside[j] else "CURRENT_HISTORY_WEIGHTS"})
+    if weights_file:weights_file.close()
+    for acc in weight_summary.values():acc["mean_effective_weight_over_supported_samples"]=acc["effective_weight_sum"]/acc["supported_satellite_epochs"]
+    return X,K,so,sk,{"method":"causal_historical_orbit_lsvce_clock_"+cfg.get("clock_weight_method","lsvce")+"_with_explicit_fallback",
+                       "names":names,"history_window_s":window,"update_interval_s":cadence,
+                       "snapshots":snapshots,"epoch_status":epochs,
+                       "effective_weights_csv":weights_path,"effective_weight_summary":weight_summary,
+                       "max_effective_weight_normalization_error":normalization_error if weights_writer else None,
+                       "variance_model_limitations":"inter-product covariance and unremoved satellite-specific biases are not estimated by the weighting model"}
+
+
+def legacy_main(c):
+    if np is None:
+        raise ValueError("numpy is required")
+    out = os.path.abspath(c["output_dir"])
+    if os.path.isdir(out) and os.listdir(out):
+        raise ValueError("output_dir must be empty; existing outputs are never overwritten")
+    systems = set(c.get("systems", ["G"]))
+    allowed_systems = set("GREC")
+    if not systems or not systems.issubset(allowed_systems):
+        raise ValueError("this version supports a non-empty subset of systems G/R/E/C only")
+    include_b2b = bool(c.get("include_b2b", False))
+    for x in c["products"]:
+        if x.get("kind", "AC").upper() not in ("AC", "B2B", "REF"):
+            raise ValueError("kind must be AC, B2B or REF: " + str(x.get("name")))
+    specs = [x for x in c["products"] if include_b2b or x.get("kind", "AC").upper() != "B2B"]
+    base = str(c.get("data_dir", ""))
+    products = [Product(x["name"], os.path.join(base, x["sp3"]), os.path.join(base, x["clk"]), x.get("kind", "AC").upper(), systems,
+                        options={"radius_max_m_by_system":c.get("radius_max_m_by_system",{}), **x}) for x in specs]
+    processing_mode = str(c.get("processing_mode","causal_replay"))
+    if processing_mode not in ("causal_replay","offline_interpolation"):
+        raise ValueError("processing_mode must be causal_replay or offline_interpolation")
+    causal_mode = processing_mode == "causal_replay"
+    strict_no_future=bool(c.get("strict_no_future_nodes",True))
+    if strict_no_future and not causal_mode:
+        raise ValueError("strict_no_future_nodes requires causal_replay; offline interpolation is forbidden")
+    if any(p.kind=="B2B" for p in products) and not causal_mode:
+        raise ValueError("B2B outage experiments require causal_replay; validate AC-only first")
+    if len({p.name for p in products}) != len(products):
+        raise ValueError("duplicate product names")
+    ac = [p for p in products if p.kind == "AC"]
+    b2bs = [p for p in products if p.kind == "B2B"]
+    refs = [p for p in products if p.kind == "REF"]
+    if len(ac) < 2 or len(b2bs) > 1 or len(refs) > 1:
+        raise ValueError("need >=2 AC products, at most one B2B and at most one REF")
+    if include_b2b and len(b2bs) != 1:
+        raise ValueError("include_b2b=true requires exactly one B2B product")
+    b2b = b2bs[0] if b2bs else None
+    ref = refs[0] if refs else None
+    bias_mode=c.get("ac_bias_mode","none")
+    radial_enabled=bool(c.get("ac_radial_clock_mapping",False))
+    if b2b and (radial_enabled or bias_mode!="none"):
+        raise ValueError("new AC preprocessing is AC-only until validated; preserve legacy B2B by disabling ac_radial_clock_mapping and setting ac_bias_mode=none")
+    if not finite(c.get("max_weight_ratio",10.)) or float(c.get("max_weight_ratio",10.))<1:
+        raise ValueError("max_weight_ratio must be finite and >=1; it bounds base inverse-variance weights")
+    if any(not p.orb_times or not p.clk_times for p in products if p.kind != "REF"):
+        raise ValueError("active product has no usable orbit/clock records")
+
+    interval = int(c.get("interval", 30)); max_orb = float(c.get("max_orbit_gap", 900)); max_clk = float(c.get("max_clock_gap", 300))
+    if interval <= 0 or max_orb <= 0 or max_clk <= 0:
+        raise ValueError("intervals must be positive")
+    formal_products = [p for p in products if p.kind != "REF"]
+    # Union coverage, not intersection: one absent product cannot truncate output.
+    # Explicit replay bounds in delivered config are preferable to inferred bounds.
+    starts = [min(p.orb_times[0],p.clk_times[0]) for p in formal_products]
+    ends = [max(p.orb_times[-1],p.clk_times[-1]) for p in formal_products]
+    start = sec(dt_parse(c["replay_start"])) if c.get("replay_start") else math.ceil(min(starts)/interval)*interval
+    end = sec(dt_parse(c["replay_end"])) if c.get("replay_end") else math.floor(max(ends)/interval)*interval
+    if end<start: raise ValueError("invalid replay coverage")
+    grid=list(range(int(start),int(end)+1,interval))
+    if not grid:
+        raise ValueError("empty output grid")
+    tarr = np.array(grid, float)
+
+    if b2b:
+        if str(c.get("window_time_system", "UTC")).upper() == "UTC":
+            t1, t2 = utc_to_gpst(c["t1"]), utc_to_gpst(c["t2"])
+        else:
+            t1, t2 = sec(dt_parse(c["t1"])), sec(dt_parse(c["t2"]))
+        if t2 <= t1:
+            raise ValueError("t2 must exceed t1")
+        inside = (tarr >= t1) & (tarr < t2)
+    else:
+        t1 = t2 = None
+        inside = np.zeros(len(grid), bool)
+    outside = ~inside
+
+    # Fixed configurable PRN registry. Neither REF nor future satellite records
+    # choose the formal satellite universe.
+    limits={"G":32,"R":24,"E":36,"C":63}
+    sats=sorted(c.get("satellites") or [f"{sys}{n:02d}" for sys in sorted(systems) for n in range(1,limits[sys]+1)])
+    if len(set(sats))!=len(sats) or any(s[0] not in systems for s in sats):
+        raise ValueError("invalid formal satellite registry")
+    print("grid epochs:", len(grid), " satellites:", len(sats), flush=True)
+    X, K = {}, {}
+    b2b_mode = str(c.get("b2b_fusion_mode", "outside_compare_inside_replace")).lower()
+    if b2b and b2b_mode not in ("outside_compare_inside_replace", "replace"):
+        raise ValueError("b2b_fusion_mode must be outside_compare_inside_replace or replace")
+    sampling_audit={}
+    # The diagnostic full AC series is not used for calibration/weights/formal output.
+    diagnostic_X,diagnostic_K={},{}
+    for p in products:
+        print("sampling",p.name,flush=True)
+        audit={};sampling_audit[p.name]=audit
+        skip=inside.copy() if p.kind=="AC" else np.zeros(len(grid),bool)
+        b2b_extrap_s = float(c.get("b2b_orbit_extrapolation_s", 15.0)) if p.kind == "B2B" and p.kind != "REF" else None
+        if b2b_extrap_s is not None and (not math.isfinite(b2b_extrap_s) or b2b_extrap_s < 0):
+            raise ValueError("b2b_orbit_extrapolation_s must be finite and non-negative")
+        X[p.name],K[p.name]=build_arrays(p,sats,grid,max_orb,max_clk,skip,
+            causal=strict_no_future or (p.kind!="REF" and causal_mode), unavailable_window=(t1,t2) if p.kind=="AC" and b2b else None,
+            audit=audit, b2b_orbit_extrapolation_s=b2b_extrap_s,
+            independent_clock_sampling=bool(c.get("independent_clock_sampling",False)))
+        if p.kind=="AC":
+            diagnostic_X[p.name],diagnostic_K[p.name]=build_arrays(p,sats,grid,max_orb,max_clk,np.zeros(len(grid),bool),causal=strict_no_future)
+
+    warnings_list = []
+    diag = {"reference_product": ref.name if ref else None, "window_gpst": [iso_sec(t1), iso_sec(t2)] if b2b else None}
+
+    # 1. AC clocks: align each GNSS system independently.
+    acn = [p.name for p in ac]
+    Kac_raw=np.stack([K[n].copy() for n in acn]);Kac=Kac_raw.copy()
+    Kac_original_aligned=Kac_raw.copy()
+    for sc in sorted(systems):
+        idx=np.array([i for i,s in enumerate(sats) if s[0]==sc])
+        aligned,_=align_ac_clocks([a[idx,:] for a in Kac_raw]);Kac_original_aligned[:,idx,:]=aligned
+    preliminary_clock=None
+    preprocessing={"radial_mapping":{},"bias_mode":bias_mode,"bias":{},"full_Chen_reproduction":False,
+                   "note":"PPP-derived ASB and antenna/attitude consistency still require external observations/model verification"}
+    if radial_enabled or bias_mode!="none":
+        # Orbit estimates do not depend on clock variances in sequential_fusion.
+        # This pass establishes the same AC orbit later written by the main pass.
+        common_orbit,preliminary_clock,_,_,_=sequential_fusion(acn,[X[n] for n in acn],list(Kac_original_aligned),sats,tarr,outside,c)
+    if radial_enabled:
+        upper=np.array([float(c.get("radius_max_m_by_system",{}).get(s[0],3e7)) for s in sats])[:,None]
+        valid_geometry=np.all(np.isfinite(common_orbit),axis=-1)&(np.linalg.norm(common_orbit,axis=-1)<=upper)
+        common_orbit=np.where(valid_geometry[...,None],common_orbit,np.nan)
+        for i,name in enumerate(acn):
+            Kac[i],preprocessing["radial_mapping"][name]=radial_clock_mapping(X[name],common_orbit,Kac[i],float(c.get("radial_clock_max_correction_m",10.)))
+    if bias_mode=="external_asb":
+        Kac,preprocessing["bias"]=apply_external_asb(Kac,acn,sats,tarr,c)
+    for sys_code in sorted(systems):
+        idx = np.array([i for i, s in enumerate(sats) if s.startswith(sys_code)], dtype=int)
+        if idx.size:
+            aligned, _ = align_ac_clocks([K[n][idx, :] for n in acn])
+            if radial_enabled or bias_mode=="external_asb":aligned,_=align_ac_clocks([a[idx,:] for a in Kac])
+            Kac[:, idx, :] = aligned
+    if bias_mode in ("relative_rolling","relative_daily"):
+        Kac,preprocessing["bias"]=ac_relative_bias_correction(Kac,acn,sats,tarr,c)
+        for sc in sorted(systems):
+            idx=np.array([i for i,s in enumerate(sats) if s[0]==sc])
+            aligned,_=align_ac_clocks([a[idx,:] for a in Kac]);Kac[:,idx,:]=aligned
+    elif bias_mode not in ("none","external_asb"):raise ValueError("unknown ac_bias_mode")
+    Kac_med = np.nanmedian(Kac, axis=0)
+    diag["ac_clock_preprocessing"]=preprocessing
+
+    # 2. B2B clock: rolling common/system/satellite calibration and jump resets.
+    Kb = None
+    b2b_diag = {}
+    if b2b:
+        Kb, clock_diag = estimate_b2b_clock_corrections(Kac_med, K[b2b.name], sats, tarr, outside, c)
+        b2b_diag["clock_correction"] = clock_diag
+
+    # 3. Orbit reference-frame unification: B2B IGb20 -> target frame.
+    target_frame = str(c.get("reference_frame", "IGS20"))
+    helmert_diag = None
+    if b2b and str(c.get("b2b_orbit_transform", "helmert_kalman")).lower() in ("helmert_kalman", "helmert_kalman_outside_only"):
+        if target_frame := str(c.get("reference_frame", "IGS20")):
+            b2b_frame = next(iter(b2b.frames), None)
+            if b2b_frame and b2b_frame != target_frame:
+                Xb_transformed, helmert_diag = transform_b2b_kalman(
+                    [X[n] for n in acn], X[b2b.name], sats, tarr, outside,
+                    q_diag=c.get("helmert_kalman_q"),
+                    r_floor=float(c.get("helmert_observation_floor_m", 1e-4)),
+                    sanity={**(c.get("helmert_sanity") or {}), "radius_max_m":max([float((c.get("helmert_sanity") or {}).get("radius_max_m",3e7))]+[float(v) for v in c.get("radius_max_m_by_system",{}).values()])},
+                    recovery_transition_s=float(c.get("recovery_transition_s",0.)))
+                X[b2b.name] = Xb_transformed
+                b2b_diag["orbit_frame_transform"] = {"from": b2b_frame, "to": target_frame, **helmert_diag}
+            else:
+                b2b_diag["orbit_frame_transform"] = {"from": b2b_frame, "to": target_frame, "status": "not_needed"}
+        else:
+            warnings_list.append("Helmert frame transform: target reference frame is empty")
+    elif b2b:
+        b2b_diag["orbit_frame_transform"] = {"status": "disabled", "method": str(c.get("b2b_orbit_transform"))}
+
+    # 4. Explicit comparison design.
+    # Formal operating sequence:
+    #   before outage: AC+B2B combined solution;
+    #   during outage: B2B-only replacement;
+    #   after recovery: AC+B2B combined solution again.
+    # AC-only remains an independent diagnostic baseline, not the formal output.
+    if b2b and b2b_mode not in ("outside_compare_inside_replace", "replace"):
+        raise ValueError("b2b_fusion_mode must be outside_compare_inside_replace (or legacy replace)")
+    diag["b2b_fusion_mode"] = "ac_plus_b2b_outside_b2b_only_inside_ac_plus_b2b_outside" if b2b else None
+    if str(c.get("weight_mode","lsvce")).lower()!="lsvce":
+        raise ValueError("only historical LSVCE with explicit fallback is supported")
+    ac_names=acn;ac_X=[X[n] for n in ac_names];ac_K=list(Kac)
+    all_names=ac_names+([b2b.name] if b2b else [])
+    all_X=ac_X+([X[b2b.name]] if b2b else [])
+    all_K=ac_K+([Kb] if b2b else [])
+    X_ac_only,K_ac_only,so_ac,sk_ac,diag_ac=sequential_fusion(ac_names,ac_X,ac_K,sats,tarr,outside,c,audit_label="ac_only")
+    if b2b:
+        X_ac_b2b,K_ac_b2b,so_all,sk_all,diag_all=sequential_fusion(all_names,all_X,all_K,sats,tarr,outside,c,audit_label="ac_plus_b2b")
+    else:
+        X_ac_b2b,K_ac_b2b,so_all,sk_all,diag_all=X_ac_only,K_ac_only,so_ac,sk_ac,diag_ac
+    diag["comparison_weights"]={"ac_only":diag_ac,**({"ac_plus_b2b":diag_all} if b2b else {})}
+    diag["weight_method"]="historical_"+c.get("clock_weight_method","lsvce")+"_explicit_fallback"
+    diag["sampling"]=sampling_audit
+    diag["causal_processing"]={
+        "availability_assumption":"record available at its timestamp; no reception-time log" if causal_mode else "offline products available in full; not a real-time availability experiment",
+        "future_records_used_for_formal_products":not causal_mode,"formal_interpolation":"exact_or_past_nodes_bounded_extrapolation" if causal_mode else "offline_two_sided_interpolation",
+        "strict_no_future_nodes":strict_no_future,"reference_sampling":"current_and_past_only" if strict_no_future else "offline_reference_only",
+        "weight_calibration":"rolling_history_through_current_epoch","outage_weights_frozen":True,
+        "reference_cannot_change_grid_satellites_or_calibration":True,
+        "diagnostic_ac_inside_outage_is_offline_only":True,
+        "recovery_does_not_ingest_missed_outage_records":True,
+        "not_a_live_PPP_continuity_certification":True}
+    diag["b2b"]=b2b_diag
+    diag["input_validation"]={"processing_mode":processing_mode,
+                              "clock_input":"CLK AS absolute satellite clocks; no raw PPP-B2b decoding",
+                              "radius_max_m_by_system":c.get("radius_max_m_by_system",{}),
+                              "products":{p.name:{"rejected_orbit_records":p.rejected_orbits,
+                                                   "sp3_epoch_scale":p.options.get("sp3_time_system_override") or p.sp3_time_system or "ASSUMED_GPS",
+                                                   "clk_epoch_scale":p.options.get("clk_time_system_override") or p.clk_time_system or "ASSUMED_GPS"} for p in products}}
+    recovery_s=float(c.get("recovery_transition_s",0.))
+    if recovery_s<0 or not math.isfinite(recovery_s): raise ValueError("invalid recovery_transition_s")
+    if b2b:
+        # B2B-only has no dependence on availability of estimated fusion weights.
+        X_b2b_in=X[b2b.name].copy(); K_b2b_in=Kb.copy()
+        transition_s=float(c.get("outage_prediction_transition_s",300.))
+        K_b2b_in,clock_bridge=bridge_to_b2b(K_ac_b2b,K_b2b_in,tarr,outside,inside,transition_s,linear=True)
+        Xc=np.where(inside[None,:,None],X_b2b_in,X_ac_b2b)
+        Kc=np.where(inside[None,:],K_b2b_in,K_ac_b2b)
+        Xc,xrec=recovery_residual_fade(Xc,X_b2b_in,X_ac_b2b,tarr,inside,recovery_s)
+        Kc,krec=recovery_residual_fade(Kc,K_b2b_in,K_ac_b2b,tarr,inside,recovery_s)
+        b2b_diag["outage_prediction_bridge"]={"orbit":{"enabled":False},"clock":clock_bridge}
+        b2b_diag["recovery_transition_bridge"]={"orbit":xrec,"clock":krec}
+    else:
+        X_b2b_in=K_b2b_in=None;Xc=X_ac_only.copy();Kc=K_ac_only.copy()
+    diag["recovery_transition_seconds"]=recovery_s
+
+    # Final output integrity gate: protect the formal product after all bridges
+    # and fusion operations, not only immediately after the Helmert transform.
+    final_sanity = dict(c.get("helmert_sanity") or {})
+    final_radius_min = float(final_sanity.get("radius_min_m", 2.0e7))
+    final_radius_max = float(final_sanity.get("radius_max_m", 3.0e7))
+    final_pos_finite = np.all(np.isfinite(Xc), axis=-1)
+    final_radius = np.linalg.norm(Xc, axis=-1)
+    final_orbit_good = final_pos_finite & np.isfinite(final_radius)
+    final_upper = np.array([float(c.get("radius_max_m_by_system",{}).get(s[0],final_radius_max)) for s in sats])[:,None]
+    final_orbit_good &= (final_radius >= final_radius_min) & (final_radius <= final_upper)
+    final_rejected = int(np.sum(final_pos_finite & ~final_orbit_good))
+    Xc = np.where(final_orbit_good[..., None], Xc, np.nan)
+    diag["output_integrity"] = {
+        "invalid_orbit_records_rejected": final_rejected,
+        "finite_orbit_records_before_gate": int(np.sum(final_pos_finite)),
+        "orbit_radius_min_m": final_radius_min,
+        "orbit_radius_max_m": final_radius_max,
+        "max_finite_orbit_radius_m": float(np.nanmax(final_radius)) if np.any(np.isfinite(final_radius)) else None,
+        "min_finite_orbit_radius_m": float(np.nanmin(final_radius)) if np.any(np.isfinite(final_radius)) else None,
+        "post_fusion_final_gate": True,
+    }
+    valid = np.all(np.isfinite(Xc), axis=-1) & np.isfinite(Kc)
+    valid_ac_only = np.all(np.isfinite(X_ac_only), axis=-1) & np.isfinite(K_ac_only)
+    valid_ac_b2b = np.all(np.isfinite(X_ac_b2b), axis=-1) & np.isfinite(K_ac_b2b)
+
+    if b2b:
+        dx=[diagnostic_X[n] for n in acn]
+        dk=np.stack([diagnostic_K[n] for n in acn])
+        for sys in sorted(systems):
+            idx=np.array([i for i,s in enumerate(sats) if s.startswith(sys)],int)
+            if idx.size: dk[:,idx,:],_=align_ac_clocks([a[idx] for a in dk])
+        # Offline equal-weight AC baseline: not a formal AC+B2B candidate.
+        baseX,_=combine(dx,np.ones(len(dx)),"orb")
+        baseK,_=combine(list(dk),np.ones(len(dx)),"clk")
+        diag["continuity"]=continuity_diagnostics(Xc,Kc,tarr,inside,baseX,baseK,X_b2b_in,K_b2b_in)
+        diag["continuity"]["usage"]="offline_AC_only_equal_weight_baseline; never used for formal generation"
+        diag["continuity"]["unavailable_samples_are_not_zero_jump"]=True
+    else: diag["continuity"]={"available":False}
+
+    # 5. Evaluation against an independent REF, when configured.
+    if ref:
+        Xr, Kr = X[ref.name], K[ref.name]
+        orbit_limit_m = float(c.get("orbit_error_sanity_limit_m", 10.0))
+        if orbit_limit_m <= 0 or not math.isfinite(orbit_limit_m):
+            raise ValueError("orbit_error_sanity_limit_m must be positive and finite")
+        ev = {
+            "ac_only_vs_ref_outside": eval_vs(Xr, Kr, X_ac_only, K_ac_only, outside, orbit_limit_m),
+        }
+        if b2b:
+            ev["ac_plus_b2b_vs_ref_outside"]=eval_vs(Xr,Kr,X_ac_b2b,K_ac_b2b,outside,orbit_limit_m)
+            ev["b2b_rtn_vs_ref_outside"] = rtn_diagnostics(Xr, X[b2b.name], tarr, outside, orbit_limit_m)
+            ev["b2b_rtn_vs_ref_inside"] = rtn_diagnostics(Xr, X[b2b.name], tarr, inside, orbit_limit_m)
+            ev["formal_rtn_vs_ref_outside"] = rtn_diagnostics(Xr, Xc, tarr, outside, orbit_limit_m)
+            ev["formal_rtn_vs_ref_inside"] = rtn_diagnostics(Xr, Xc, tarr, inside, orbit_limit_m)
+            
+
+        for i, n in enumerate(acn):
+            ev[n + "_vs_ref_outside"] = eval_vs(Xr, Kr, X[n], Kac[i], outside, orbit_limit_m)
+        diag["evaluation_vs_ref"] = ev
+        clock_ev = {
+            "ac_only_outside":clock_evaluation_by_system(Kr,K_ac_only,sats,outside),
+            "formal_outside":clock_evaluation_by_system(Kr,Kc,sats,outside),
+        }
+        for i,n in enumerate(acn):
+            clock_ev[n+"_outside"] = clock_evaluation_by_system(Kr,Kac[i],sats,outside)
+        if b2b:
+            clock_ev["ac_plus_b2b_outside"]=clock_evaluation_by_system(Kr,K_ac_b2b,sats,outside)
+            clock_ev["formal_inside"] = clock_evaluation_by_system(Kr,Kc,sats,inside)
+            clock_ev["b2b_corrected_inside"] = clock_evaluation_by_system(Kr,Kb,sats,inside)
+            clock_ev["b2b_raw_inside"] = clock_evaluation_by_system(Kr,K[b2b.name],sats,inside)
+        diag["clock_evaluation_by_system_vs_ref"] = clock_ev
+        if not b2b:
+            variants={"M0_"+n:Kac_original_aligned[i] for i,n in enumerate(acn)}
+            variants["M1_original_equal"]=np.nanmean(Kac_original_aligned,axis=0)
+            variants["M2_original_weighted"]=preliminary_clock if preliminary_clock is not None else K_ac_only
+            variants["M3_preprocessed_equal"]=np.nanmean(Kac,axis=0)
+            variants["M4_preprocessed_weighted"]=K_ac_only
+            shared=np.isfinite(Kr)&np.all(np.isfinite(Kac_original_aligned),axis=0)&np.all(np.isfinite(Kac),axis=0)
+            shared &= np.logical_and.reduce([np.isfinite(v) for v in variants.values()])
+            diag["ac_common_sample_comparison"]={
+                "reference":ref.name,"calibration_reference":c.get("ac_bias_reference") if bias_mode.startswith("relative") else None,
+                "common_satellite_epochs":int(shared.sum()),"definition":"same satellites/epochs and per-system datum for every variant; COD not used for calibration",
+                "variants":{label:clock_evaluation_by_system(np.where(shared,Kr,np.nan),np.where(shared,v,np.nan),sats,np.ones(len(tarr),bool)) for label,v in variants.items()}}
+        diag["legacy_clock_evaluation_note"] = "evaluation_vs_ref clock RMS uses a pooled four-system datum; use clock_evaluation_by_system_vs_ref for within-system clock quality"
+    elif b2b:
+        # This is only an internal consistency difference, not an accuracy
+        # improvement claim: no independent truth/reference is configured.
+        diag["internal_comparison"] = {
+            "ac_only_vs_ac_plus_b2b_outside": eval_vs(X_ac_only, K_ac_only, X_ac_b2b, K_ac_b2b, outside, float(c.get("orbit_error_sanity_limit_m", 10.0))),
+            "interpretation": "difference_between_solutions_only; no_accuracy_ordering_without_ref",
+        }
+    diag["comparison_semantics"] = {
+        "formal_solution": {"before_outage": "ac_plus_b2b" if b2b else "ac_only", "inside": "b2b_only" if b2b else "not_applicable", "after_recovery": "ac_plus_b2b" if b2b else "ac_only"},
+        "diagnostic_only": {"outside": "ac_only"},
+        "inside_no_ac_blend": True,
+        "inside_prediction_uses_only_pre_outage_formal_solution": True,
+        "prediction_transition_is_not_ac_observation": True,
+        "absolute_accuracy_requires_ref": True,
+        "frame_mismatch_is_diagnostic_until_transformed": True,
+    }
+    diag["formal_method"] = {
+        "variance_method": "causal_historical_"+c.get("clock_weight_method","lsvce")+"_or_explicit_fallback",
+        "robust_method": "rolling_median_MAD_clock_bias_and_huber_fusion",
+        "three_cornered_hat": "disabled",
+        "l1": "not_used",
+        "hierarchical_clock_model": "causal_rolling_common_system_satellite_bias_no_trend",
+        "radial_clock_mapping": "AC_to_combined_orbit_DX_zero" if radial_enabled else "not_implemented",
+        "rtn": "diagnostic_only",
+    }
+    # 6. gates / warnings (same spirit as before)
+    target = str(c.get("reference_frame", "IGS20"))
+    diag["frame_metadata"] = {p.name: sorted(p.frames) for p in products}
+    for p in products:
+        transform_info = b2b_diag.get("orbit_frame_transform", {}) if p.kind == "B2B" else {}
+        transformed_b2b = bool(p.kind == "B2B" and transform_info.get("to") == target)
+        if target not in p.frames and not transformed_b2b:
+            warnings_list.append(p.name + ": frame " + str(sorted(p.frames)) + " is not independently verified in " + target)
+            if b2b and p.kind == "B2B" and c.get("allow_untransformed_b2b", False) is not True:
+                warnings_list.append("B2B frame mismatch: AC+B2B orbit comparison is diagnostic-only until an explicit frame transform is configured")
+        if p.sp3_time_system != "GPS" or p.clk_time_system not in ("GPS", "GNSS_BROADCAST"):
+            warnings_list.append(p.name + ": SP3/CLK time system is not explicitly GPS/GNSS-broadcast aligned")
+    if len(ac) < 3:
+        warnings_list.append("fewer than 3 AC products: three-cornered-hat weighting is not determined")
+    if not c.get("bias_definition_verified", False):
+        warnings_list.append("OSB/DCB/BSX bias definition not verified for PPP")
+    if b2b and not c.get("b2b_generation_chain_verified", False):
+        warnings_list.append("B2B generation chain not independently verified")
+    if b2b:
+        ib = all_names.index(b2b.name)
+        b2b_orbit_sigma = float(np.nanmedian(np.sqrt(so_all[ib])))
+        b2b_clock_sigma = float(np.nanmedian(np.sqrt(sk_all[ib])))
+        diag["b2b"]["orbit_sigma_m_median"] = b2b_orbit_sigma
+        diag["b2b"]["clock_sigma_m_median"] = b2b_clock_sigma
+        if b2b_orbit_sigma > float(c.get("max_b2b_orbit_sigma_m", 0.50)):
+            warnings_list.append("B2B orbit sigma %.3f m exceeds gate" % b2b_orbit_sigma)
+        if b2b_clock_sigma > float(c.get("max_b2b_clock_sigma_m", 0.50)):
+            warnings_list.append("B2B clock sigma %.3f m exceeds gate" % b2b_clock_sigma)
+    for label,wdiag in diag["comparison_weights"].items():
+        counts=defaultdict(int)
+        for snap in wdiag["snapshots"]:
+            for sd in snap["systems"].values():
+                for kind in ("orbit","clock"): counts[sd[kind]["status"]]+=1
+        wdiag["weight_status_counts"]=dict(counts)
+        if any(k.startswith("FALLBACK") for k in counts):
+            warnings_list.append(label+": explicit conservative/previous-weight fallback used")
+    if b2b:
+        warnings_list.append("Record-epoch replay only; actual reception latency and PPP positioning not verified")
+        if b2b_diag.get("clock_correction",{}).get("uncalibrated_satellites"):
+            warnings_list.append("Some satellites lack B2B clock calibration; see calibration status")
+    formal_ok = not warnings_list
+    diag["warnings"] = warnings_list
+    diag["formal_gate"] = "PASS" if formal_ok else "FAIL"
+    diag["status"] = "EXPERIMENTAL" if formal_ok else ("UNVERIFIED_DEMO" if c.get("allow_unverified_demo", False) else "DIAGNOSTIC_ONLY")
+    report = {"config": c, "products": [p.report() for p in products], "diagnostics": diag}
+    os.makedirs(out, exist_ok=True)
+    if not formal_ok and not c.get("allow_unverified_demo", False):
+        with open(os.path.join(out, "quality.json"), "w", encoding="utf8") as f:
+            json.dump(json_safe(report), f, indent=2, allow_nan=False)
+        raise ValueError("formal quality gate blocked fusion; diagnostic quality.json written")
+
+    # 7. write outputs
+    sat_out = [sats[i] for i in range(len(sats)) if valid[i].any()]
+    first = utc_from_sec(grid[0]); week, wsec = gps_week_sec(first)
+    sp3_path = os.path.join(out, "combined.sp3"); clk_path = os.path.join(out, "combined.clk"); log_path = os.path.join(out, "combined.log")
+    frame = target if all(target in p.frames for p in products if p.kind != "B2B") and (not b2b or b2b_diag.get("orbit_frame_transform", {}).get("to") == target or b2b_diag.get("orbit_frame_transform", {}).get("status") == "not_needed") else "MIXED"
+    with open(sp3_path, "w", newline="\n") as f:
+        f.write(f"#cP{first:%Y %m %d %H %M} {first.second + first.microsecond / 1e6:11.8f} {len(grid):7d} ORBIT {frame:5s} FIT  MULTI\n")
+        mjd = (first - datetime(1858, 11, 17, tzinfo=timezone.utc)).days
+        dayfrac = (first.hour * 3600 + first.minute * 60 + first.second) / 86400
+        f.write(f"## {week:4d}{wsec:16.8f}{interval:15.8f}{mjd:6d}{dayfrac:16.13f}\n")
+        for i in range(0, max(85, len(sat_out)), 17):
+            chunk = sat_out[i:i + 17]
+            prefix = f"+  {len(sat_out):3d}   " if i == 0 else "+        "
+            f.write(prefix + "".join(chunk) + "  0" * (17 - len(chunk)) + "\n")
+        for i in range(0, max(85, len(sat_out)), 17):
+            f.write("++       " + "  0" * 17 + "\n")
+        f.write("%c GRECcc GPS ccc cccc cccc ccccc ccccc ccccc ccccc\n%c cc cc ccc ccc cccc cccc cccc ccccc ccccc ccccc ccccc ccccc\n%f  1.2500000  1.025000000  0.00000000000  0.000000000000000\n%f  0.0000000  0.000000000  0.00000000000  0.000000000000000\n%i    0    0    0    0      0      0      0      0         0\n%i    0    0    0    0      0      0      0      0         0\n")
+        for comment in (("CAUSAL RECORD-EPOCH REPLAY" if causal_mode else "OFFLINE TWO-SIDED INTERPOLATION") + "; NOT A LIVE PPP CERTIFICATION", "Systems: " + " ".join(sorted(systems)), "Time tags: GPS; no PPP accuracy certification", "Missing satellites are omitted"): 
+            f.write("/* " + comment + "\n")
+        for j, t in enumerate(grid):
+            d = utc_from_sec(t)
+            f.write(f"*  {d:%Y %m %d %H %M %S.%f}\n")
+            for i, prn in enumerate(sats):
+                if valid[i, j]:
+                    x = Xc[i, j]
+                    f.write(f"P{prn}{x[0] / 1000:14.6f}{x[1] / 1000:14.6f}{x[2] / 1000:14.6f}{Kc[i, j] * 1e6:14.6f}\n")
+        f.write("EOF\n")
+    with open(clk_path, "w", newline="\n") as f:
+        def h(value, label):
+            f.write(f"{value:<60}{label}\n")
+        h("     3.00           C                   G", "RINEX VERSION / TYPE")
+        h("OFFLINE             OK Work             EXPERIMENTAL", "PGM / RUN BY / DATE")
+        h("   GPS", "TIME SYSTEM ID"); h("     1    AS", "# / TYPES OF DATA"); h(f"{interval:10.3f}", "INTERVAL"); h("Systems: " + " ".join(sorted(systems)), "COMMENT"); h("", "END OF HEADER")
+        for j, t in enumerate(grid):
+            d = utc_from_sec(t)
+            for i, prn in enumerate(sats):
+                if (np.isfinite(Kc[i,j]) if c.get("independent_clock_sampling",False) else valid[i,j]):
+                    f.write(f"AS {prn:<3s}  {d:%Y %m %d %H %M}{d.second + d.microsecond / 1e6:10.6f}  1   {Kc[i, j]:19.12E}\n")
+    npe = valid.sum(axis=0)
+    diag["coverage_grid"] = {"start": iso_sec(start), "end": iso_sec(end), "interval": interval, "epochs": len(grid)}
+    diag["sats_per_epoch"] = {"outside_min_med_max": [int(npe[outside].min()), float(np.median(npe[outside])), int(npe[outside].max())] if outside.any() else None,
+                               "inside_min_med_max": [int(npe[inside].min()), float(np.median(npe[inside])), int(npe[inside].max())] if inside.any() else None}
+    report["outputs"] = {"mode": ("ac_plus_b2b_outside_b2b_only_inside_ac_plus_b2b_outside" if b2b else "ac_only"), "systems": sorted(systems), "sp3": sp3_path, "clk": clk_path, "log": log_path, "records": int(valid.sum()), "grid_epochs": len(grid)}
+    report["outputs"]["clock_records"] = int(np.isfinite(Kc).sum()) if c.get("independent_clock_sampling",False) else int(valid.sum())
+    report["outputs"]["records_definition"] = "SP3 paired orbit-clock records; CLK may have more records with independent sampling"
+    with open(log_path, "w", encoding="utf8", newline="\n") as f:
+        json.dump(json_safe(report), f, indent=2, allow_nan=False)
+        f.write("\n--- per-epoch summary: time mode n_sats ---\n")
+        for j, t in enumerate(grid):
+            f.write(f"{iso_sec(t)} {'b2b_only' if inside[j] else ('ac_plus_b2b' if b2b else 'ac_only')} {int(npe[j])}\n")
+    with open(os.path.join(out, "quality.json"), "w", encoding="utf8") as f:
+        json.dump(json_safe(report), f, indent=2, allow_nan=False)
+    print(json.dumps(json_safe(report["outputs"]), indent=2, allow_nan=False))
+    return {"orbit":Xc,"clock":Kc,"sats":sats,"grid":tarr,"report":report,
+            "experiment_arrays":{"orbit":X,"raw_clock":K,"aligned_ac_clock":Kac,
+                                 "ac_names":acn,"reference_name":ref.name if ref else None,
+                                 "ac_only_orbit":X_ac_only,"ac_only_clock":K_ac_only,"outside":outside}}
+
+
+# ---------------- Mansur (2024) postprocessed clock baseline ----------------
+# Legacy functions above are retained for compatibility, but are not called by
+# this pipeline. Clock Eqs. 15-18 use orbit-paper Eqs. 15,22,23 (Mansur 2022).
+
+def paper_modified_z(values, threshold=3.5, axis=None):
+    """Iglewicz-Hoaglin modified Z score. No artificial MAD noise floor.
+
+    If MAD=0, non-median finite values are flagged. The threshold and this
+    degenerate-data policy are implementation settings, not paper constants.
+    """
+    a=np.asarray(values,float)
+    center=np.nanmedian(a,axis=axis,keepdims=True)
+    dev=np.abs(a-center); spread=np.nanmedian(dev,axis=axis,keepdims=True)
+    score=np.divide(.6745*dev,spread,
+                    out=np.full_like(dev,np.nan),where=spread>0)
+    score=np.where((spread==0)&(dev==0),0.,score)
+    score=np.where((spread==0)&(dev>0),np.inf,score)
+    return np.isfinite(a)&(score>float(threshold))
+
+
+def paper_nonnegative_normal(N, rhs):
+    """Solve min .5*x.T*N*x-rhs.T*x, x>=0 by a primal active set.
+
+    Teunissen-Amiri-Simkooei (2008), Sect 3.6. Refit the free
+    components at each boundary, rather than clipping an unconstrained answer.
+    The tolerances below test floating-point KKT residuals, not noise floors.
+    """
+    N=np.asarray(N,float);rhs=np.asarray(rhs,float);R=len(rhs)
+    scale=max(float(np.max(np.abs(N))),float(np.max(np.abs(rhs))))
+    if not np.isfinite(scale) or scale<=0:raise np.linalg.LinAlgError('invalid NNLS normal system')
+    H=N/scale;b=rhs/scale;x=np.zeros(R);free=np.zeros(R,bool)
+    tol=256*np.finfo(float).eps*max(1,R)*max(1.,float(np.max(np.abs(b))))
+    for outer in range(max(50,20*R*R)):
+        gain=b-H@x
+        if not np.any((~free)&(gain>tol)):break
+        candidates=np.where(~free,gain,-np.inf);free[int(np.argmax(candidates))]=True
+        for inner in range(max(50,20*R*R)):
+            z=np.zeros(R);z[free]=np.linalg.solve(H[np.ix_(free,free)],b[free])
+            if np.all(z[free]>0):x=z;break
+            removing=free&(z<=0)
+            den=x[removing]-z[removing]
+            alpha=float(np.min(np.divide(x[removing],den,out=np.zeros_like(den),where=den>0)))
+            x=x+alpha*(z-x)
+            boundary=free&(x<=tol*max(1.,float(np.max(np.abs(x)))))
+            x[boundary]=0.;free[boundary]=False
+        else:raise np.linalg.LinAlgError('NNLS inner iteration limit')
+    else:raise np.linalg.LinAlgError('NNLS outer iteration limit')
+    gradient=H@x-b;positive=x>0
+    residual=max(float(np.max(np.abs(gradient[positive]))) if positive.any() else 0.,
+                 float(np.max(np.maximum(-gradient[~positive],0))) if (~positive).any() else 0.)
+    if residual>max(1e-10,10*tol):raise np.linalg.LinAlgError('NNLS KKT check failed')
+    return x,{'KKT_residual_scaled':residual,'active_zero_indices':np.flatnonzero(~positive).tolist(),
+              'normal_objective':float(.5*x@N@x-rhs@x)}
+
+
+def paper_lsvce(values, min_samples=100, max_iterations=100, relative_tol=1e-8, constraint='unconstrained'):
+    """Exact reduced normal equations, Mansur 2022 (15),(22),(23).
+
+    values: R x n, same complete scalar samples for every participating AC.
+    For clocks values are metres (c*dt); for orbits they are XYZ metres.
+    D=[-1...-1; I], Qr=D.T diag(er) D, Qt=sum(sigma2_r Qr).
+    N_rl=n/2 tr(Qr Qt^-1 Ql Qt^-1), l_r=1/2 sum(t.T Qt^-1
+    Qr Qt^-1 t). Solve N sigma2=l, not residual/leverage iteration.
+    Optional nonnegative normal-equation solve follows the cited 2008 Sect3.6;
+    it is an explicitly labelled extension, not a documented Mansur setting.
+    No centering, Huber, variance floors, weight caps or silent fallback.
+    """
+    if constraint not in ('unconstrained','nonnegative'):raise ValueError('vce_constraint must be unconstrained or nonnegative')
+    V=np.asarray(values,float)
+    if V.ndim!=2: raise ValueError('LSVCE requires R x n scalar observations')
+    R,n=V.shape
+    audit={'method':'Mansur2022_eq15_22_23_Mansur2024_eq15_18',
+           'products':R,'scalar_samples':n,'converged':False,'history':[],
+           'variance_units':'m2','floors_or_weight_caps':False,
+           'between_AC_correlations':'assumed_zero_as_in_paper',
+           'constraint':constraint,'constraint_source':'Teunissen-Amiri-Simkooei2008 Sect3.6' if constraint=='nonnegative' else None}
+    if R<3:
+        audit['reason']='UNIDENTIFIABLE_WITH_FEWER_THAN_THREE_ACS'; return None,audit
+    if n<min_samples or not np.isfinite(V).all():
+        audit['reason']='INSUFFICIENT_OR_NONCOMMON_SAMPLES';return None,audit
+    # n can be hundreds of thousands; only (R-1)^2 and R^2 matrices are built.
+    D=np.vstack([-np.ones((1,R-1)),np.eye(R-1)])
+    Qr=np.einsum('ri,rj->rij',D,D)
+    differences=V[1:]-V[0]
+    scatter=differences@differences.T
+    audit['misclosure_second_moment_m2']=(scatter/n).tolist()
+    audit['misclosure_mean_m']=np.mean(differences,axis=1).tolist()
+    audit['misclosure_mean_energy_fraction']=float(n*np.sum(np.mean(differences,axis=1)**2)/np.trace(scatter)) if np.trace(scatter)>0 else None
+    audit['zero_mean_assumption']='E[misclosure]=0; mean reported for diagnosis, not subtracted from the paper second-moment estimator'
+    scale=float(np.trace(scatter)/max(1,n*(R-1)))
+    if not np.isfinite(scale) or scale<=0:
+        audit['reason']='ZERO_MISClosure_VARIANCE';return None,audit
+    # Rescale for numerical conditioning, not as a statistical variance floor.
+    scatter=scatter/scale
+    sig=np.ones(R)
+    for it in range(int(max_iterations)):
+        Qt=np.einsum('r,rij->ij',sig,Qr)
+        try:
+            inv=np.linalg.inv(Qt)
+            blocks=np.einsum('rij,jk->rik',Qr,inv)
+            N=.5*n*np.einsum('rij,sji->rs',blocks,blocks)
+            rhs=.5*np.einsum('rij,ji->r',np.einsum('ij,rjk,kl->ril',inv,Qr,inv),scatter)
+            cond=float(np.linalg.cond(N))
+            if not np.isfinite(cond) or cond>1e14:raise np.linalg.LinAlgError('ill-conditioned normal matrix')
+            unconstrained=np.linalg.solve(N,rhs)
+            if constraint=='nonnegative':new,kkt=paper_nonnegative_normal(N,rhs)
+            else:new=unconstrained;kkt={}
+        except np.linalg.LinAlgError as exc:
+            audit.update(reason='SINGULAR_NORMAL_EQUATIONS',detail=str(exc));return None,audit
+        change=float(np.max(np.abs(new-sig)/np.maximum(np.abs(sig),np.finfo(float).tiny)))
+        audit['history'].append({'iteration':it+1,'sigma2_m2':(new*scale).tolist(),
+                                 'unconstrained_sigma2_m2':(unconstrained*scale).tolist(),
+                                 'relative_change':change,'normal_condition':cond,**kkt})
+        audit.update(normal_matrix=N.tolist(),normal_rhs=rhs.tolist(),
+                     normal_equation_scale_m2=scale,
+                     normal_solution_residual=float(np.linalg.norm(N@new-rhs)/max(np.linalg.norm(rhs),np.finfo(float).tiny)))
+        if not np.isfinite(new).all() or (constraint=='unconstrained' and np.any(new<=0)):
+            audit.update(reason='NONPOSITIVE_UNCONSTRAINED_VARIANCE',
+                         unconstrained_sigma2_m2=(new*scale).tolist(),
+                         policy='strict unconstrained baseline cannot use nonpositive inverse-variance weights; inspect sampling uncertainty, core, alignment and correlations; constrained VCE not enabled')
+            return None,audit
+        if constraint=='nonnegative':
+            audit.update(unconstrained_sigma2_m2=(unconstrained*scale).tolist(),
+                         constrained_solution=new.tolist(),**kkt)
+            # Two exact sources force a singular differenced covariance. There
+            # is no unique inverse-variance combination; never invent a floor.
+            if (new==0).sum()>1 or not np.any(new>0):
+                audit.update(reason='DEGENERATE_NONNEGATIVE_COVARIANCE');return None,audit
+        sig=new
+        if change<=relative_tol:
+            boundary=bool(np.any(sig==0))
+            audit.update(converged=True,reason='CONVERGED_BOUNDARY' if boundary else 'CONVERGED',iterations_used=it+1,
+                         normal_rank=int(np.linalg.matrix_rank(N)),
+                         variance_component_covariance_m4=None if boundary else (np.linalg.inv(N)*scale*scale).tolist(),
+                         variance_component_std_m2=None if boundary else (np.sqrt(np.diag(np.linalg.inv(N)))*scale).tolist(),
+                         boundary_warning='zero is a fitted model boundary, not evidence of an error-free AC; inverse-variance limiting combination may select only that AC' if boundary else None,
+                         component_uncertainty_conditions='Gaussian independent selected scalar samples; alignments treated as fixed; model-based precision, not an empirical accuracy certificate')
+            return sig*scale,audit
+    audit.update(reason='ITERATION_LIMIT',iterations_used=int(max_iterations))
+    return None,audit
+
+
+def paper_inverse_variance_mean(values, sigma2):
+    """Inverse variance mean; exact zero uses its mathematical weight limit.
+
+    If the unique boundary AC is unavailable, use the available positive
+    components. No arbitrary epsilon or variance floor is introduced.
+    """
+    V=np.asarray(values,float);sig=np.asarray(sigma2,float)
+    vector=V.ndim==4
+    available=np.all(np.isfinite(V),axis=-1) if vector else np.isfinite(V)
+    shape=(len(sig),)+(1,)*(available.ndim-1)
+    if not np.isfinite(sig).all() or np.any(sig<0):raise ValueError('invalid variances for inverse variance mean')
+    if np.count_nonzero(sig==0)>1:raise ValueError('multiple zero variances do not define a unique combination')
+    positive=sig>0;base=np.zeros_like(sig)
+    if positive.any():base[positive]=np.min(sig[positive])/sig[positive]
+    W=base.reshape(shape)*available
+    zero=(sig==0).reshape(shape)*available
+    W=np.where(zero.any(axis=0,keepdims=True),zero.astype(float),W)
+    den=W.sum(axis=0)
+    if vector:
+        numerator=(np.where(available[...,None],V,0.)*W[...,None]).sum(axis=0)
+        result=np.divide(numerator,den[...,None],out=np.full_like(numerator,np.nan),where=den[...,None]>0)
+    else:
+        numerator=(np.where(available,V,0.)*W).sum(axis=0)
+        result=np.divide(numerator,den,out=np.full_like(numerator,np.nan),where=den>0)
+    effective=np.divide(W,den[None],out=np.zeros_like(W),where=den[None]>0)
+    return result,effective
+
+
+def paper_helmert_fit(source,target,mask):
+    """Mansur2022 Eq3-5: source=H*common+translation; apply H inverse.
+
+    Solve the linearized seven-parameter model in the published direction,
+    with H=mu*(I-skew(theta)). The linear coefficients for the rotations
+    are mu*theta. Returned parameters map COMMON -> AC, and transformed
+    coordinates map AC -> COMMON. This is not a forward small-angle addition.
+    """
+    good=mask&np.all(np.isfinite(source),axis=-1)&np.all(np.isfinite(target),axis=-1)
+    x=source[good];y=target[good]
+    if len(x)<3:raise ValueError('insufficient orbit geometry for seven parameters')
+    A=np.vstack([helmert_design(r) for r in y]);A[:,3:6]*=-1.;b=(x-y).reshape(-1)
+    if np.linalg.matrix_rank(A)<7:raise ValueError('rank deficient orbit Helmert fit')
+    u=np.linalg.lstsq(A,b,rcond=None)[0]
+    scale=u[6]/R_EARTH;mu=1.+scale
+    if not np.isfinite(mu) or abs(mu)<1e-12:raise ValueError('noninvertible Helmert scale')
+    theta=np.r_[u[:3],u[3:6]/R_EARTH/mu,scale]
+    wx,wy,wz=theta[3:6]
+    H=mu*np.array([[1.,wz,-wy],[-wz,1.,wx],[wy,-wx,1.]])
+    transformed=(source-theta[:3])@np.linalg.inv(H).T
+    return transformed,theta,float(np.sqrt(np.mean((A@u-b)**2)))
+
+
+def paper_orbit_core(aligned,common,sats,cfg):
+    """Common full-arc satellites, RAC anomaly screen before VCE."""
+    P,S,T,_=aligned.shape
+    delta=aligned-common[None]
+    er=common/np.linalg.norm(common,axis=-1)[...,None]
+    # Velocity used only for RAC screening; orbital inertial velocity includes
+    # Earth rotation. Sampling is uniformly spaced, scale cancels on normalization.
+    v=np.gradient(common,axis=1)/(float(cfg['interval']))
+    v+=np.cross(np.array([0.,0.,7.2921151467e-5]),common)
+    en=np.cross(common,v);en/=np.linalg.norm(en,axis=-1)[...,None]
+    et=np.cross(en,er)
+    rac=np.stack([np.sum(delta*b[None],axis=-1) for b in [er,et,en]],axis=-1)
+    bad=np.zeros((P,S),bool)
+    rms=np.sqrt(np.nanmean(rac*rac,axis=2))
+    for sc in sorted(set(s[0] for s in sats)):
+        idx=np.array([i for i,s in enumerate(sats) if s[0]==sc])
+        threshold=float(cfg.get('orbit_z_threshold_by_system',{}).get(sc,cfg.get('modified_z_threshold',3.5)))
+        for p in range(P):
+            bad[p,idx]=np.any(paper_modified_z(rms[p,idx],threshold,axis=0),axis=-1)
+    # The AC-constellation model only requires completeness for ACs actually
+    # providing that constellation. A GPS-only AC must not remove all Galileo
+    # or BDS satellites from the core of three other participating ACs.
+    core=np.zeros(S,bool)
+    for sc in sorted(set(s[0] for s in sats)):
+        idx=np.array([i for i,s in enumerate(sats) if s[0]==sc])
+        active=np.flatnonzero(np.any(np.isfinite(aligned[:,idx]),axis=(1,2,3)))
+        if not len(active):continue
+        complete=np.all(np.isfinite(aligned[active][:,idx]),axis=(0,2,3))
+        geometry=np.all(np.isfinite(rms[active][:,idx]),axis=(0,2))
+        core[idx]=complete&geometry&~bad[active][:,idx].any(axis=0)
+    return core,bad,rms
+
+
+def paper_supporting_orbit(V,names,sats,times,cfg):
+    """Supporting orbit combination: Mansur2022 steps and reduced LSVCE.
+
+    This is separate from the 2024 clock pipeline. Published orbit Z screening
+    does not specify every aggregation setting: this implementation uses
+    satellite-wise RAC RMS, reports it, and labels that choice explicitly.
+    """
+    source=np.array(V,copy=True)
+    if source.ndim!=4 or source.shape[-1]!=3 or source.shape[2]<2:
+        return None,None,{'success':False,'reason':'INVALID_ORBIT_ARRAY_OR_ARC','detail':'requires AC x satellite x >=2 epochs x XYZ'}
+    initial=np.nanmedian(source,axis=0)
+    deviation=np.linalg.norm(source-initial[None],axis=-1)
+    rough=deviation>float(cfg.get('orbit_rough_limit_m',500.))
+    source[rough]=np.nan
+    common=np.nanmean(source,axis=0)
+    # Seven free AC transforms do not fix the frame of the common orbit.
+    # Anchor that gauge to the initial mean made from participating ACs only.
+    # This is a disclosed datum convention, not an external ITRF calibration.
+    frame_datum=common.copy()
+    frame_policy=cfg.get('orbit_frame_datum','initial_mean')
+    if frame_policy not in ('initial_mean','free'):
+        raise ValueError('orbit_frame_datum must be initial_mean or free')
+    fitting=np.all(np.isfinite(source),axis=-1)
+    history=[];last=None;P,S,T,_=source.shape
+    rejected_for_estimation=np.zeros((P,S),bool)
+    for iteration in range(int(cfg.get('orbit_max_iterations',30))):
+        aligned=[];transforms=[]
+        for p,name in enumerate(names):
+            try:a,theta,rms=paper_helmert_fit(source[p],common,fitting[p])
+            except (ValueError,np.linalg.LinAlgError) as exc:
+                return None,None,{'success':False,'reason':'HELMERT_GEOMETRY_FAILED','failed_AC':name,
+                    'detail':str(exc),'iteration':iteration+1,'usable_satellite_epochs':int((fitting[p]&np.all(np.isfinite(common),axis=-1)).sum()),
+                    'iterations':history,'source_frames_are_metadata_not_a_geometry_guarantee':True}
+            aligned.append(a);transforms.append({'AC':name,'parameters':theta.tolist(),
+                'parameter_units':['m','m','m','rad','rad','rad','1'],
+                'parameter_direction':'COMMON_to_AC; inverse applied to positions',
+                'coordinate_operation':'Mansur2022 Eq5 H^-1(source-translation)','fit_scalar_rms_m':rms})
+        aligned=np.stack(aligned)
+        core,bad,rac_rms=paper_orbit_core(aligned,common,sats,cfg)
+        # A rejected AC/satellite must not re-enter the frame fit and VCE on
+        # the next iteration merely because its residual changed slightly.
+        # Cumulative exclusion is an explicit within-arc screening choice;
+        # final products still include noncore satellites as in orbit step 5.
+        newly_rejected=bad&~rejected_for_estimation
+        rejected_for_estimation |= bad
+        bad=rejected_for_estimation.copy()
+        for sc in sorted(set(s[0] for s in sats)):
+            idx=np.array([i for i,s in enumerate(sats) if s[0]==sc])
+            active=np.flatnonzero(np.any(np.isfinite(aligned[:,idx]),axis=(1,2,3)))
+            if len(active):core[idx] &= ~bad[active][:,idx].any(axis=0)
+        combined=np.full_like(common,np.nan);weights={};failures=[]
+        for sc in sorted(set(s[0] for s in sats)):
+            idx=np.array([i for i,s in enumerate(sats) if s[0]==sc]);ci=idx[core[idx]]
+            active=np.flatnonzero(np.any(np.isfinite(aligned[:,idx]),axis=(1,2,3)))
+            matrix=aligned[active][:,ci].reshape(len(active),-1) if len(active) else np.empty((0,0))
+            sig,audit=paper_lsvce(matrix,int(cfg.get('vce_min_scalar_samples',100)),
+                    int(cfg.get('vce_max_iterations',100)),float(cfg.get('vce_relative_tol',1e-8)),cfg.get('vce_constraint','unconstrained'))
+            if len(ci)<int(cfg.get('core_min_satellites',3)):
+                sig=None;audit.update(converged=False,reason='INSUFFICIENT_CORE_SATELLITES')
+            entry={'names':[names[p] for p in active],'core_satellites':[sats[i] for i in ci],
+                   'estimation':audit,'sigma2_m2':sig.tolist() if sig is not None else None,
+                   'core_selection':{
+                       'input_satellites':len(idx),'participating_ACs':len(active),
+                       'complete_common_satellites':int(np.all(np.isfinite(aligned[active][:,idx]),axis=(0,2,3)).sum()) if len(active) else 0,
+                       'excluded_for_RAC_outlier':[sats[i] for i in idx if len(active) and bad[active,i].any()],
+                       'excluded_for_RAC_geometry':[sats[i] for i in idx if len(active) and not np.isfinite(rac_rms[active,i]).all()],
+                       'missing_epoch_satellites':{names[p]:[sats[i] for i in idx if not np.isfinite(aligned[p,i]).all()] for p in active}}}
+            if sig is None:failures.append(sc)
+            else:
+                a,_=paper_inverse_variance_mean(aligned[active][:,idx],sig);combined[idx]=a
+                _,bw=paper_inverse_variance_mean(np.zeros((len(sig),1)),sig)
+                entry['normalized_base_weights']=bw[:,0].tolist()
+            weights[sc]=entry
+        if failures:
+            return None,None,{'success':False,'reason':'ORBIT_VCE_FAILED','failed_systems':failures,
+                              'successful_systems':[s for s in weights if s not in failures],
+                              'failed_iteration':iteration+1,'weights':weights,'transforms':transforms,'iterations':history,
+                              'core_rejection_note':'VCE model uses only participating ACs in each constellation; no variance clipping/fallback'}
+        good=np.all(np.isfinite(common)&np.isfinite(combined),axis=-1)
+        if not good.any():return None,None,{'success':False,'reason':'NO_COMMON_COMBINATION_EPOCHS','weights':weights,'iterations':history}
+        raw_shift=float(np.sqrt(np.mean(np.sum((combined[good]-common[good])**2,axis=-1))))
+        datum_parameters=None
+        if frame_policy=='initial_mean':
+            datum_mask=np.all(np.isfinite(combined)&np.isfinite(frame_datum),axis=-1)
+            combined,datum_parameters,_=paper_helmert_fit(combined,frame_datum,datum_mask)
+            wx,wy,wz=datum_parameters[3:6];mu=1.+datum_parameters[6]
+            H=mu*np.array([[1.,wz,-wy],[-wz,1.,wx],[wy,-wx,1.]])
+            aligned=(aligned-datum_parameters[:3])@np.linalg.inv(H).T
+        shift=float(np.sqrt(np.mean(np.sum((combined[good]-common[good])**2,axis=-1))))
+        history.append({'iteration':iteration+1,'combination_change_3d_rms_m':shift,
+                         'before_datum_alignment_change_3d_rms_m':raw_shift,
+                         'datum_parameters':None if datum_parameters is None else datum_parameters.tolist(),
+                         'new_AC_satellite_rejections':int(newly_rejected.sum()),
+                         'cumulative_AC_satellite_rejections':int(bad.sum()),
+                         'core_satellites':[s for s,k in zip(sats,core) if k]})
+        common=combined;last=(aligned,weights,transforms,core,bad,rac_rms)
+        # Only the samples retained for this AC are used in the next frame fit.
+        fitting=np.all(np.isfinite(source),axis=-1)&~bad[:,:,None]
+        if shift<=float(cfg.get('orbit_convergence_m',.001)):break
+    else:
+        return None,None,{'success':False,'reason':'ORBIT_ITERATION_LIMIT','iterations':history,
+              'weights':weights,'transforms':transforms,'failed_iteration':len(history),
+              'convergence_limit_m':float(cfg.get('orbit_convergence_m',.001)),
+              'last_change_3d_rms_m':history[-1]['combination_change_3d_rms_m'] if history else None}
+    aligned,weights,transforms,core,bad,rac_rms=last
+    return common,aligned,{'success':True,'method':'Mansur2022_supporting_orbit',
+             'frame_datum':frame_policy,
+             'frame_datum_note':'initial AC mean defines the free seven-parameter common-frame gauge; applied to both combined and associated AC coordinates; not an independent ITRF realization or a documented author-software convention',
+             'iterations':history,'weights':weights,'transforms':transforms,
+             'rough_rejected_satellite_epochs':int(rough.sum()),
+             'screening_implementation':'satellite RAC RMS modified Z by AC/constellation; aggregation not fully specified in paper',
+             'iteration_rejection_policy':'cumulative AC/satellite exclusion within the daily arc; no automatic re-entry into Helmert/VCE; final noncore orbits retained',
+             'rejected_for_core':{n:[s for s,k in zip(sats,bad[p]) if k] for p,n in enumerate(names)}}
+
+
+def paper_clock_alignment(K,names,sats,times,cfg):
+    """AC-wide offset/drift using GPS, then constellation-constant ISB.
+
+    Returns corrected raw data as well as a calibration mask. No per-epoch
+    median clock subtraction or rolling satellite bias correction is used.
+    GLONASS satellite-wise daily ISB is separately configurable (paper's
+    discussion on FDMA); it is never silently applied to other systems.
+    """
+    V=np.array(K,copy=True);P,S,T=V.shape
+    good=np.isfinite(V);point_bad=np.zeros_like(good)
+    threshold=float(cfg.get('modified_z_threshold',3.5))
+    for p in range(P):
+        for i in range(S):point_bad[p,i]=paper_modified_z(V[p,i],threshold)
+    clean=np.where(point_bad,np.nan,V)
+    gps=np.array([i for i,s in enumerate(sats) if s[0]==cfg.get('reference_system','G')])
+    if not len(gps):raise ValueError('reference system has no satellite clocks')
+    x=(times-times[0])/3600.;A=np.stack([np.ones(T),x],axis=1)
+    # A temporary ensemble is only used to select a median-trend reference AC.
+    # The article does not give an exact selection formula; report this rule.
+    ensemble=np.nanmedian(clean[:,gps],axis=0)
+    trends=[]
+    for p in range(P):
+        d=clean[p,gps]-ensemble;valid=np.isfinite(d);jj=np.where(valid)[1]
+        if len(jj)<int(cfg.get('alignment_min_samples',30)) or len(np.unique(jj))<2:
+            trends.append(np.nan)
+        else:trends.append(float(np.linalg.lstsq(A[jj],d[valid]*C,rcond=None)[0][1]))
+    selected=cfg.get('reference_ac','auto_median_trend')
+    represented_systems=sorted(set(s[0] for i,s in enumerate(sats) if np.isfinite(V[:,i]).any()))
+    reference_candidates=[]
+    for p in range(P):
+        covers=all(np.isfinite(clean[p,[i for i,s in enumerate(sats) if s[0]==sc]]).sum()>=int(cfg.get('alignment_min_samples',30)) for sc in represented_systems)
+        if covers and np.isfinite(trends[p]):reference_candidates.append(p)
+    if selected=='auto_median_trend':
+        if not reference_candidates:raise ValueError('no reference AC covers the represented constellations; select a smaller systems scope or provide a suitable reference AC')
+        center=float(np.nanmedian(np.asarray(trends)[reference_candidates]));r=min(reference_candidates,key=lambda p:abs(trends[p]-center))
+    else:
+        if selected not in names:raise ValueError('reference_ac must be a participating AC, never REF')
+        r=names.index(selected)
+        if r not in reference_candidates:raise ValueError('configured reference AC does not provide sufficient samples in every represented constellation')
+    audit={'reference_ac':names[r],'reference_system':cfg.get('reference_system','G'),
+           'selection':'nearest median GPS trend relative to ensemble; explicit reproducibility choice' if selected=='auto_median_trend' else 'configured participating AC',
+           'selection_trends_m_per_hour':dict(zip(names,trends)),'AC_offset_drift':{},'ISB':{},
+           'eligible_reference_ACs':[names[p] for p in reference_candidates],
+           'reference_coverage_rule':'reference must cover every represented constellation; no fabricated ISB for unavailable sources',
+           'initial_point_outliers':{n:int(point_bad[p].sum()) for p,n in enumerate(names)}}
+    # Step 2 removes isolated bad values from the product, not only from VCE.
+    # Keeping noncore satellites in step 7 does not restore rejected records.
+    corrected=clean.copy();linear_clean=clean.copy()
+    audit['initial_point_policy']='exclude flagged records from both estimation and final combination; retain other epochs of the satellite'
+    for p,n in enumerate(names):
+        if p==r:beta=np.zeros(2);nfit=int(np.isfinite(clean[p,gps]).sum())
+        else:
+            d=clean[p,gps]-clean[r,gps];valid=np.isfinite(d);jj=np.where(valid)[1]
+            nfit=int(valid.sum())
+            if nfit<int(cfg.get('alignment_min_samples',30)) or len(np.unique(jj))<2:
+                raise ValueError(n+': insufficient common reference-system clocks for linear alignment')
+            beta=np.linalg.lstsq(A[jj],d[valid]*C,rcond=None)[0]
+        delta=(A@beta)/C
+        corrected[p]-=delta[None];linear_clean[p]-=delta[None]
+        audit['AC_offset_drift'][n]={'offset_m':float(beta[0]),'drift_m_per_hour':float(beta[1]),
+                                    'samples':nfit,'applied_to_all_constellations':True}
+    # Stage 4, satellite-wise RMS with respect to reference; used for calibration
+    # and VCE eligibility, while final combination retains flagged clocks.
+    satellite_bad=np.zeros((P,S),bool);sat_rms=np.full((P,S),np.nan)
+    for sc in sorted(set(s[0] for s in sats)):
+        idx=np.array([i for i,s in enumerate(sats) if s[0]==sc])
+        for p in range(P):
+            residual=(linear_clean[p,idx]-linear_clean[r,idx])*C
+            sat_rms[p,idx]=np.sqrt(np.nanmean(residual*residual,axis=1))
+            satellite_bad[p,idx]=paper_modified_z(sat_rms[p,idx],threshold)
+    fit_clean=np.where(satellite_bad[:,:,None],np.nan,linear_clean)
+    for p,n in enumerate(names):
+        audit['ISB'][n]={}
+        for sc in sorted(set(s[0] for s in sats)):
+            if sc==cfg.get('reference_system','G'):continue
+            idx=np.array([i for i,s in enumerate(sats) if s[0]==sc])
+            if not np.isfinite(V[p,idx]).any():
+                audit['ISB'][n][sc]={'status':'NOT_PROVIDED_BY_THIS_AC','applied':False}
+                continue
+            d=fit_clean[p,idx]-fit_clean[r,idx];valid=np.isfinite(d)
+            if p==r:offset=0.
+            elif valid.sum()<int(cfg.get('alignment_min_samples',30)):
+                raise ValueError(n+': insufficient '+sc+' samples for ISB alignment')
+            else:offset=float(np.mean(d[valid]))
+            corrected[p,idx]-=offset;fit_clean[p,idx]-=offset
+            audit['ISB'][n][sc]={'added_seconds':-offset,'estimated_test_minus_reference_m':offset*C,
+                                 'model':'one constant per AC/constellation; no system-specific drift'}
+    if cfg.get('glonass_satellite_isb',False):
+        audit['glonass_satellite_isb']={}
+        for p,n in enumerate(names):
+            audit['glonass_satellite_isb'][n]={}
+            for i,s in enumerate(sats):
+                if s[0]!='R':continue
+                d=linear_clean[p,i]-linear_clean[r,i];valid=np.isfinite(d)
+                if valid.sum()<int(cfg.get('alignment_min_samples',30)):continue
+                # Subtract remaining satellite constant after system ISB.
+                d=corrected[p,i]-corrected[r,i]
+                valid &= np.isfinite(d);offset=float(np.mean(d[valid])) if valid.any() else 0.
+                corrected[p,i]-=offset;fit_clean[p,i]-=offset
+                audit['glonass_satellite_isb'][n][s]={'added_seconds':-offset,'samples':int(valid.sum())}
+        audit['glonass_satellite_isb_note']='daily satellite constants mentioned in Mansur2024 FDMA discussion; explicit option, not an ASB estimate from observations'
+    return corrected,fit_clean,audit,point_bad,satellite_bad,sat_rms
+
+
+def paper_clock_core(clean,names,sats,cfg,availability=None):
+    """Full-arc common coverage; outlier epochs excluded jointly for all ACs.
+
+    A single epoch outlier does not remove all remaining epochs of a common
+    satellite. Flattened VCE columns are synchronized complete observations.
+    """
+    P,S,T=clean.shape
+    across=paper_modified_z(clean,float(cfg.get('modified_z_threshold',3.5)),axis=0)
+    eligible=np.where(across,np.nan,clean)
+    core={};active_by_system={}
+    for sc in sorted(set(s[0] for s in sats)):
+        idx=np.array([i for i,s in enumerate(sats) if s[0]==sc])
+        coverage=clean if availability is None else availability
+        # Participation comes from the supplied/aligned product, before the
+        # later calibration masks. An entirely rejected AC must not vanish
+        # silently and change the variance model.
+        active=np.flatnonzero(np.any(np.isfinite(coverage[:,idx]),axis=(1,2)))
+        active_by_system[sc]=active
+        common=np.all(np.isfinite(coverage[active][:,idx]),axis=(0,2)) if len(active) else np.zeros(len(idx),bool)
+        common &= np.any(np.all(np.isfinite(eligible[active][:,idx]),axis=0),axis=1) if len(active) else False
+        core[sc]=idx[common]
+    return core,active_by_system,across,eligible
+
+
+def paper_stability(clock_seconds,interval):
+    """Overlapping Allan deviation of clock-time series, finite continuous arcs.
+
+    This is evaluation only, not part of the combination algorithm. Units are
+    fractional frequency. Never bridge a missing epoch in a stability statistic.
+    """
+    a=np.asarray(clock_seconds,float);result=[];T=a.shape[1]
+    for m in [1,2,4,8,16,32,64]:
+        if 2*m>=T:break
+        d=a[:,2*m:]-2*a[:,m:-m]+a[:,:-2*m]
+        invalid=np.c_[np.zeros((len(a),1),int),np.cumsum(~np.isfinite(a),axis=1)]
+        good=(invalid[:,2*m+1:]-invalid[:,:-2*m-1])==0
+        v=d[good];tau=float(interval*m)
+        result.append({'tau_s':tau,'samples':int(v.size),
+                       'overlapping_ADEV':float(np.sqrt(np.mean(v*v)/(2*tau*tau))) if len(v) else None})
+    return result
+
+
+def paper_clock_eval(reference,test,sats,interval):
+    mask=np.ones(reference.shape[1],bool)
+    e=clock_evaluation_by_system(reference,test,sats,mask)
+    for sc,z in e['systems'].items():
+        idx=np.array([i for i,s in enumerate(sats) if s[0]==sc]);D=(test[idx]-reference[idx])*C
+        n=np.isfinite(D).sum(axis=0);center=np.nanmedian(D,axis=0);center[n<3]=np.nan
+        residual=D-center[None]
+        for label,values in [('raw_difference',D),('common_offset',center),('datum_removed_residual',residual)]:
+            valid=values[np.isfinite(values)];z[label]['std_m']=float(np.std(valid)) if valid.size else None
+        z['residual_overlapping_ADEV']=paper_stability(residual/C,interval)
+    return e
+
+
+def paper_radial_correction(common,ac_orbit,clock):
+    """Mansur2024 Eq13; all positions must share the combined-orbit frame."""
+    radius=np.linalg.norm(ac_orbit,axis=-1)
+    good=np.all(np.isfinite(ac_orbit),axis=-1)&np.all(np.isfinite(common),axis=-1)&np.isfinite(clock)&(radius>0)
+    delta=np.full(clock.shape,np.nan)
+    delta[good]=np.sum((common[good]-ac_orbit[good])*ac_orbit[good],axis=-1)/radius[good]/C
+    return np.where(good,clock+delta,np.nan),delta,good
+
+
+def paper_sample(product,sats,times,cfg):
+    """Baseline uses exact 5-min CLK records, no clock interpolation.
+
+    SP3 at grid nodes is exact. Optional two-sided polynomial interpolation
+    uses degree 10 (11 nodes); beyond the last orbit epoch only explicitly
+    bounded two-node linear extrapolation is permitted, as in the paper.
+    """
+    S,T=len(sats),len(times);X=np.full((S,T,3),np.nan);K=np.full((S,T),np.nan)
+    counts={'orbit':defaultdict(int),'clock':defaultdict(int)}
+    station=cfg.get('reference_station_by_ac',{}).get(product.name)
+    if station is not None:
+        station=str(station).upper()
+        if station not in product.station_clk.v:
+            raise ValueError(product.name+': requested reference station '+station+' has no AR records in its CLK file')
+    for i,s in enumerate(sats):
+        ot=product.orb.times(s);ct=product.clk.times(s)
+        for j,t in enumerate(times):
+            k=product.clk.v.get(s,{}).get(float(t))
+            if k is not None and np.isfinite(k):
+                ref=product.station_clk.v[station].get(float(t)) if station else 0.
+                if ref is not None and np.isfinite(ref):
+                    K[i,j]=k-ref;counts['clock']['exact']+=1
+                else:counts['clock']['missing_reference_station_epoch']+=1
+            else:counts['clock']['missing']+=1
+            o,status=product.orb.query(s,float(t),float(cfg.get('max_orbit_gap',900)),True,degree=10,causal=False)
+            if o is None and len(ot)>=2 and t>ot[-1] and t-ot[-1]<=float(cfg.get('orbit_end_extrapolation_s',300)) and ot[-1]-ot[-2]<=float(cfg.get('max_orbit_gap',900)):
+                o=lagrange([(v,product.orb.v[s][v]) for v in ot[-2:]],float(t),1);status='end_linear_extrapolation'
+            if o is not None:X[i,j]=o
+            counts['orbit'][status]+=1
+    audit={k:dict(v) for k,v in counts.items()}
+    audit['reference_station']={'enabled':bool(station),'station':station,
+            'formula':'satellite_CLK - station_AR_CLK, Mansur2024 Eq6',
+            'epoch_policy':'exact AR samples; missing station epochs excluded; no interpolation'}
+    return X,K,audit
+
+
+def paper_write_products(out,X,K,sats,times,frame,interval):
+    """Paired products with proper SP3-d headers and CLK AS seconds."""
+    os.makedirs(out,exist_ok=True)
+    sp3=os.path.join(out,'combined.sp3');clk=os.path.join(out,'combined.clk')
+    paired=np.all(np.isfinite(X),axis=-1)&np.isfinite(K)
+    listed=[s for i,s in enumerate(sats) if paired[i].any()]
+    first=utc_from_sec(times[0]);week,wsec=gps_week_sec(first)
+    with open(sp3,'w',newline='\n') as f:
+        f.write(f'#dP{first.year:4d} {first.month:2d} {first.day:2d} {first.hour:2d} {first.minute:2d} {first.second+first.microsecond/1e6:11.8f} {len(times):7d} ORBIT {frame:5s} FIT MULT\n')
+        mjd=(first-datetime(1858,11,17,tzinfo=timezone.utc)).days
+        fraction=(first.hour*3600+first.minute*60+first.second)/86400.
+        f.write(f'## {week:4d} {wsec:15.8f} {interval:14.8f} {mjd:5d} {fraction:15.13f}\n')
+        lines=max(5,int(math.ceil(len(listed)/17)))
+        for i in range(lines):
+            chunk=listed[17*i:17*(i+1)]
+            f.write((f'+  {len(listed):3d}   ' if i==0 else '+        ')+''.join(chunk)+'  0'*(17-len(chunk))+'\n')
+        for i in range(lines):f.write('++       '+'  0'*17+'\n')
+        f.write('%c M  cc GPS ccc cccc cccc cccc ccccc ccccc ccccc ccccc\n%c cc cc ccc ccc cccc cccc cccc ccccc ccccc ccccc ccccc\n')
+        f.write('%f  1.2500000  1.025000000  0.00000000000  0.000000000000000\n%f  0.0000000  0.000000000  0.00000000000  0.000000000000000\n')
+        f.write('%i    0    0    0    0      0      0      0      0         0\n%i    0    0    0    0      0      0      0      0         0\n')
+        for text in ['MANSUR 2024 POSTPROCESSED CLOCK BASELINE','FULL ARC AND FUTURE DATA USED; NOT REAL TIME','Clock values: microseconds; positions: kilometres','Missing paired records omitted; no PPP certification']:f.write('/* '+text+'\n')
+        for j,t in enumerate(times):
+            d=utc_from_sec(t);f.write(f'*  {d.year:4d} {d.month:2d} {d.day:2d} {d.hour:2d} {d.minute:2d} {d.second+d.microsecond/1e6:11.8f}\n')
+            for i,s in enumerate(sats):
+                if paired[i,j]:f.write(f'P{s}{X[i,j,0]/1000:14.6f}{X[i,j,1]/1000:14.6f}{X[i,j,2]/1000:14.6f}{K[i,j]*1e6:14.6f}\n')
+        f.write('EOF\n')
+    with open(clk,'w',newline='\n') as f:
+        def h(value,label):f.write(f'{value:<60}{label}\n')
+        h('     3.00           C                   M','RINEX VERSION / TYPE')
+        h('PAPER LSVCE         POSTPROCESS','PGM / RUN BY / DATE');h('GPS','TIME SYSTEM ID')
+        h('     1    AS','# / TYPES OF DATA');h(f'{interval:10.3f}','INTERVAL')
+        h('Full-arc processing; reference AC datum, not IGS Time','COMMENT');h('','END OF HEADER')
+        for j,t in enumerate(times):
+            d=utc_from_sec(t)
+            for i,s in enumerate(sats):
+                if np.isfinite(K[i,j]):f.write(f'AS {s}  {d.year:4d} {d.month:02d} {d.day:02d} {d.hour:02d} {d.minute:02d} {d.second+d.microsecond/1e6:9.6f}  1   {K[i,j]:19.12E}\n')
+    return {'mode':'mansur2024_postprocessed_clock_baseline','sp3':sp3,'clk':clk,
+             'records':int(paired.sum()),'clock_records':int(np.isfinite(K).sum()),'grid_epochs':len(times)}
+
+
+def paper_failure_summary(report):
+    """Expose evidence, not just the generic 'supporting orbit failed' label."""
+    d=report.get('diagnostics',{});o=d.get('supporting_orbit',{})
+    lines=['status: '+str(d.get('status','UNKNOWN'))]
+    if o:
+        lines.append('supporting_orbit: '+str(o.get('reason','SUCCESS' if o.get('success') else 'UNKNOWN')))
+        if o.get('detail'):lines.append(str(o['detail']))
+        if o.get('failed_AC'):lines.append('failed AC: '+str(o['failed_AC']))
+        if o.get('failed_iteration'):lines.append('failed orbit iteration: '+str(o['failed_iteration']))
+        if o.get('last_change_3d_rms_m') is not None:lines.append('last orbit change [m]: '+str(o['last_change_3d_rms_m']))
+        for sc,z in o.get('weights',{}).items():
+            a=z.get('estimation',{});names=z.get('names',[])
+            lines.append(f"orbit {sc}: {a.get('reason','UNKNOWN')}; ACs={','.join(names)}; core={len(z.get('core_satellites',[]))}; scalar samples={a.get('scalar_samples',0)}")
+            if a.get('unconstrained_sigma2_m2') is not None:lines.append('  unconstrained sigma2 [m2]: '+str(dict(zip(names,a['unconstrained_sigma2_m2']))))
+            if a.get('constraint')=='nonnegative':
+                lines.append('  fitted nonnegative sigma2 [m2]: '+str(z.get('sigma2_m2')))
+                lines.append('  normalized weights: '+str(z.get('normalized_base_weights')))
+                if a.get('boundary_warning'):lines.append('  '+a['boundary_warning'])
+            cs=z.get('core_selection',{})
+            if cs:lines.append(f"  complete common={cs.get('complete_common_satellites')}; RAC excluded={len(cs.get('excluded_for_RAC_outlier',[]))}; geometry excluded={len(cs.get('excluded_for_RAC_geometry',[]))}")
+    for sc,z in d.get('clock_weights',{}).items():
+        a=z.get('estimation',{})
+        lines.append(f"clock {sc}: {a.get('reason','UNKNOWN')}; core={len(z.get('core_satellites',[]))}; scalar samples={a.get('scalar_samples',0)}")
+        if a.get('unconstrained_sigma2_m2') is not None:lines.append('  unconstrained sigma2 [m2]: '+str(dict(zip(z.get('names',[]),a['unconstrained_sigma2_m2']))))
+        if a.get('boundary_warning'):lines.append('  '+a['boundary_warning'])
+    if d.get('failure_detail'):lines.append(str(d['failure_detail']))
+    return '\n'.join(lines)
+
+
+def paper_diagnose_file(path):
+    with open(path,encoding='utf-8-sig') as f:r=json.load(f)
+    print(paper_failure_summary(r))
+    print('No data or output files changed; negative/underidentified variances are not clipped or replaced.')
+
+
+def paper_replay_vce_file(path):
+    """Replay sufficient second moments only, not original orbit/CLK products."""
+    with open(path,encoding='utf-8-sig') as f:r=json.load(f)
+    results={}
+    for sc,z in r.get('diagnostics',{}).get('supporting_orbit',{}).get('weights',{}).items():
+        a=z['estimation'];n=int(a['scalar_samples']);R=len(z['names'])
+        if 'misclosure_second_moment_m2' in a:M=np.array(a['misclosure_second_moment_m2'])
+        elif R==3 and a.get('unconstrained_sigma2_m2') is not None:
+            v=np.array(a['unconstrained_sigma2_m2']);M=np.array([[v[0]+v[1],v[0]],[v[0],v[0]+v[2]]])
+        else:raise ValueError('report lacks sufficient moments for replay')
+        L=np.linalg.cholesky(M);V=np.zeros((R,n));V[1:,:R-1]=L*np.sqrt(n)
+        strict,old=paper_lsvce(V,min_samples=1)
+        sig,new=paper_lsvce(V,min_samples=1,constraint='nonnegative')
+        results[sc]={'names':z['names'],'strict_reason':old['reason'],'constrained_reason':new['reason'],
+             'sigma2_m2':None if sig is None else sig.tolist(),'iterations':new.get('iterations_used'),
+             'normalized_weights':None if sig is None else paper_inverse_variance_mean(np.zeros((R,1)),sig)[1][:,0].tolist(),
+             'KKT_residual_scaled':new.get('KKT_residual_scaled')}
+    print(json.dumps({'scope':'SECOND_MOMENT_REPLAY_ONLY; not original data rerun; no SP3/CLK generated',
+                      'results':results},ensure_ascii=False,indent=2))
+    return results
+
+
+def paper_baseline_main(cfg):
+    if np is None:raise RuntimeError('NumPy is required')
+    if cfg.get('include_b2b',False):raise ValueError('Mansur baseline excludes B2B')
+    if cfg.get('strict_no_future_nodes',False):raise ValueError('paper baseline is explicitly offline; strict_no_future_nodes must be false')
+    if cfg.get('vce_constraint','unconstrained') not in ('unconstrained','nonnegative'):raise ValueError('invalid vce_constraint')
+    interval=float(cfg.get('interval',300))
+    if interval!=300.:raise ValueError('paper replication uses 300 s epochs; other intervals need a separate experiment')
+    out=cfg['output_dir']
+    if os.path.isdir(out) and os.listdir(out):raise ValueError('output_dir is nonempty; use a new directory to preserve results')
+    systems=cfg.get('systems',['G','R','E','C']);data=cfg.get('data_dir','.')
+    acspec=[p for p in cfg['products'] if p.get('kind','AC').upper()=='AC']
+    if len(acspec)<3:raise ValueError('paper LSVCE needs at least three ACs')
+    if len({p['name'] for p in acspec})!=len(acspec):raise ValueError('duplicate AC names')
+    refs=[p for p in cfg['products'] if p.get('kind','AC').upper()=='REF']
+    if len(refs)>1:raise ValueError('use one independent evaluation reference')
+    if refs and refs[0]['name'] in {p['name'] for p in acspec}:raise ValueError('REF cannot participate as AC')
+    missing=[]
+    for p in acspec+refs:
+        for key in ('sp3','clk'):
+            path=os.path.join(data,p[key])
+            if not os.path.isfile(path):missing.append(p['name']+' '+key+': '+path)
+    if cfg.get('combined_orbit_file'):
+        path=os.path.join(data,cfg['combined_orbit_file'])
+        if not os.path.isfile(path):missing.append('combined_orbit_file: '+path)
+    if missing:raise ValueError('required input files are missing:\n'+'\n'.join(missing))
+    station_map=cfg.get('reference_station_by_ac',{})
+    if not isinstance(station_map,dict):raise ValueError('reference_station_by_ac must be an AC-to-station object')
+    if set(station_map)-set(p['name'] for p in acspec):
+        raise ValueError('reference_station_by_ac may only name participating ACs')
+    os.makedirs(out,exist_ok=True)
+    def product(p):
+        options={**cfg,**p.get('options',{})}
+        return Product(p['name'],os.path.join(data,p['sp3']),os.path.join(data,p['clk']),p.get('kind','AC'),systems,options)
+    # Read active ACs before REF: independent evaluation cannot change sampling,
+    # reference selection, transformations, core satellites, weights or outputs.
+    ac=[product(p) for p in acspec];names=[p.name for p in ac]
+    if any(not p.orb_times or not p.clk_times for p in ac):raise ValueError('AC has no orbit or clock records')
+    start=sec(dt_parse(cfg.get('arc_start',iso_sec(min(min(p.clk_times) for p in ac)))))
+    end=sec(dt_parse(cfg.get('arc_end',iso_sec(max(max(p.clk_times) for p in ac)))))
+    start=math.ceil(start/interval)*interval;end=math.floor(end/interval)*interval
+    if end<start:raise ValueError('empty baseline arc')
+    if utc_from_sec(start).date()!=utc_from_sec(end).date():raise ValueError('process one GPST day at a time')
+    times=np.arange(start,end+interval*.1,interval)
+    sats=sorted(set().union(*(set(p.clk.v)|set(p.orb.v) for p in ac)))
+    if cfg.get('satellites'):sats=[s for s in sats if s in cfg['satellites']]
+    X=[];K=[];sampling={}
+    for p in ac:
+        x,k,a=paper_sample(p,sats,times,cfg);X.append(x);K.append(k);sampling[p.name]=a
+    X=np.stack(X);raw=np.stack(K)
+    settings=['zero MAD treatment and detector sample grouping','median-trend reference selection tie-break',
+              'minimum core/support counts','numerical convergence tolerances',
+              'orbit RAC RMS aggregation and cumulative within-arc rejection without re-entry',
+              'orbit frame gauge fixed to initial participating-AC mean; optional free-gauge sensitivity run',
+              'full-arc common satellite coverage with synchronized epoch exclusion',
+              'nonpositive variance rejection (article does not specify a numerical remedy)']
+    diag={'paper_reproduction':{'clock_paper_doi':'10.1007/s10291-023-01604-4',
+              'implementation_revision':'2026-10-13-paper-workflow-review',
+              'vce_derivation_doi':'10.1007/s00190-022-01685-y',
+              'scope':'seven-step postprocessed clock pipeline and reduced LSVCE equations',
+              'same_data_as_paper':False,'bitwise_original_software_reproduction':False,
+              'underdocumented_settings':settings,'satellite_attitude_correction':False,
+              'reference_chain':[
+                  {'source':'Mansur et al. 2024','doi':'10.1007/s10291-023-01604-4','used_for':'clock Eq13-18 and seven-step workflow'},
+                  {'source':'Mansur et al. 2022','doi':'10.1007/s00190-022-01685-y','used_for':'orbit Eq3-5 inverse Helmert and Eq15,22,23 reduced LSVCE'},
+                  {'source':'Amiri-Simkooei 2007 doctoral thesis','url':'https://ncgeo.nl/wp-content/uploads/2024/06/64AmiriSimkooei.pdf','used_for':'Eq4.85-4.86 minimum-variance normal equations; Q0=0 specialization'},
+                  {'source':'Teunissen and Amiri-Simkooei 2008','doi':'10.1007/s00190-007-0157-x','used_for':'LSVCE estimability, Gaussian normal-equation covariance; optional Section3.6 nonnegative constrained normal equations'},
+                  {'source':'Iglewicz and Hoaglin 1993; NIST handbook','url':'https://www.itl.nist.gov/div898/handbook/eda/section3/eda35h.htm','used_for':'0.6745*(value-median)/MAD; 3.5 potential-outlier criterion'},
+                  {'source':'Kouba and Springer 2001','doi':'10.1007/PL00012863','used_for':'background alignment reference; no original implementation equivalence claimed'}],
+              'modified_Z_convention':{'coefficient':.6745,'threshold':float(cfg.get('modified_z_threshold',3.5)),
+                   'threshold_source':'Iglewicz-Hoaglin recommendation, as documented by NIST; application grouping still implementation-specific'},
+              'negative_variance_policy':{'mode':cfg.get('vce_constraint','unconstrained'),
+                   'interpretation':'can result from limited precision even with valid model; not proof of corrupted data',
+                   'theory_alternatives':'nonnegativity constraints or exponential parameterization, Teunissen2008 Section3.6',
+                   'alternatives_enabled':cfg.get('vce_constraint','unconstrained')=='nonnegative',
+                   'replication_deviation':'Nonnegative LS-VCE from cited 2008 Sect3.6; Mansur2022/2024 do not document using this constraint' if cfg.get('vce_constraint')=='nonnegative' else None,
+                   'zero_boundary_policy':'exact inverse-variance limit; available unique zero component receives weight 1; positive ACs used when boundary AC missing; multiple zeros rejected'},
+              'GLONASS_satellite_ISB':bool(cfg.get('glonass_satellite_isb',False)),
+              'reference_station_by_ac':station_map},
+          'causal_processing':{'strict_no_future_nodes':False,'future_records_used_for_formal_products':True,
+               'availability_assumption':'full postprocessed daily arc; not real-time replay'},
+          'sampling':sampling,'disabled_methods':['Huber','satellite_quality_factor','epoch_quality_factor',
+             'three_corner_hat','rolling_bias','time_varying_weights','B2B'],
+          'time_assumptions':{p.name:{'SP3':p.options.get('sp3_time_system_override') or p.sp3_time_system or 'ASSUMED_GPS',
+                                    'CLK':p.options.get('clk_time_system_override') or p.clk_time_system or 'ASSUMED_GPS'} for p in ac}}
+    report={'config':cfg,'products':[p.report() for p in ac],'diagnostics':diag}
+    def save():
+        with open(os.path.join(out,'quality.json'),'w',encoding='utf-8') as f:json.dump(json_safe(report),f,indent=2,allow_nan=False)
+    def stop(status,detail):
+        diag['status']=status;diag['failure_detail']=detail;save()
+        summary=paper_failure_summary(report)
+        with open(os.path.join(out,'failure_summary.txt'),'w',encoding='utf-8') as f:f.write(summary+'\n')
+        raise ValueError(summary+'\nDiagnostics: '+os.path.join(out,'quality.json'))
+    coverage={}
+    for p in ac:
+        provided=set(p.clk_times)
+        missing_epochs=[float(t) for t in times if float(t) not in provided]
+        coverage[p.name]={'missing_grid_epochs':len(missing_epochs),
+            'first_missing_epoch':iso_sec(missing_epochs[0]) if missing_epochs else None,
+            'last_missing_epoch':iso_sec(missing_epochs[-1]) if missing_epochs else None,
+            'actual_CLK_end':iso_sec(p.clk_times[-1]),
+            'malformed_clock_records':p.malformed_clock_records}
+    diag['clock_arc_coverage']=coverage
+    diag['arc_scope']={'requested_start_GPST':iso_sec(times[0]),
+        'requested_end_GPST':iso_sec(times[-1]),'grid_epochs':len(times),
+        'full_300s_GPST_day':len(times)==288 and utc_from_sec(times[0]).hour==0 and utc_from_sec(times[0]).minute==0}
+    incomplete=[n+': '+str(z['missing_grid_epochs'])+' missing grid epochs from '
+        +str(z['first_missing_epoch'])+' to '+str(z['last_missing_epoch'])
+        +'; actual CLK end='+z['actual_CLK_end'] for n,z in coverage.items() if z['missing_grid_epochs']]
+    if incomplete:
+        stop('CLOCK_ARC_COVERAGE_FAILED','Requested arc is not covered by every AC CLK. Supply complete CLK files or explicitly configure a shorter diagnostic arc; no automatic arc truncation.\n'+'\n'.join(incomplete))
+    # A user-supplied independently combined orbit can replace the supporting
+    # module, without letting the evaluation COD orbit calibrate the solution.
+    if cfg.get('combined_orbit_file'):
+        path=os.path.join(data,cfg['combined_orbit_file'])
+        if refs and os.path.abspath(path)==os.path.abspath(os.path.join(data,refs[0]['sp3'])):
+            raise ValueError('evaluation REF orbit cannot be used as radial calibration orbit')
+        p=Product('COMBINED_ORBIT',path,ac[0].clk_path,'ORBIT',systems,cfg)
+        if str(cfg.get('reference_frame','IGS20')) not in p.frames:
+            raise ValueError('external combined orbit frame label differs from reference_frame; verify it before radial correction')
+        common,_,a=paper_sample(p,sats,times,cfg)
+        associated=[];external_transforms=[]
+        for ap,n in enumerate(names):
+            transformed,theta,rms=paper_helmert_fit(X[ap],common,np.all(np.isfinite(X[ap])&np.isfinite(common),axis=-1))
+            associated.append(transformed);external_transforms.append({'AC':n,'parameters':theta.tolist(),
+                  'parameter_direction':'COMMON_to_AC; inverse applied to positions','fit_scalar_rms_m':rms})
+        associated=np.stack(associated)
+        orbit_audit={'success':True,'method':'external_combined_orbit','path':path,'sampling':a,
+                      'AC_frame_alignment_before_radial':external_transforms}
+    else:common,associated,orbit_audit=paper_supporting_orbit(X,names,sats,times,cfg)
+    diag['supporting_orbit']=orbit_audit
+    if common is None:
+        stop('ORBIT_DEPENDENCY_FAILED','No clock product generated: supporting orbit estimation failed under the configured VCE model. Inspect the detailed system/AC reason above.')
+    # Eq13 uses xbar_r. Keep it consistent with the xbar from Eq5 of the
+    # referenced orbit paper: AC coordinates expressed in the combined frame.
+    # Preserve an explicitly labelled original-orbit sensitivity mode only.
+    basis=cfg.get('radial_ac_orbit_basis','helmert_aligned')
+    if basis not in ('helmert_aligned','original'):raise ValueError('invalid radial_ac_orbit_basis')
+    radial_orbits=associated if basis=='helmert_aligned' else X
+    diag['paper_reproduction']['radial_AC_orbit_basis']=basis
+    diag['paper_reproduction']['radial_frame_note']='xbar interpreted consistently with Mansur2022 Eq5; exact original software convention still needs author-code comparison'
+    if basis=='original':diag['paper_reproduction']['nonbaseline_variant']='original-orbit radial sensitivity variant; not the cross-paper xbar convention'
+    mapped=raw.copy();radial={}
+    for p,n in enumerate(names):
+        mapped[p],delta,good=paper_radial_correction(common,radial_orbits[p],raw[p])
+        radial[n]={'mapped_samples':int(good.sum()),'unmapped_clocks_excluded_from_baseline':int((np.isfinite(raw[p])&~good).sum()),
+                   'added_range_correction_m':error_stats(delta*C),
+                   'AC_orbit_basis':basis,'formula':'Mansur2024 Eq13: (combined-xbar_AC) dot xbar_AC / (norm(xbar_AC)*c)'}
+    diag['radial_correction']=radial
+    try:aligned,clean,align_audit,point_bad,sat_bad,sat_rms=paper_clock_alignment(mapped,names,sats,times,cfg)
+    except (ValueError,np.linalg.LinAlgError) as exc:stop('CLOCK_ALIGNMENT_FAILED',str(exc))
+    diag['clock_alignment']=align_audit
+    # Full-arc coverage means supplied radial-mappable records, before point
+    # rejection. Rejected epochs are then removed synchronously from every AC
+    # in the VCE matrix; a single bad record need not erase a satellite's day.
+    core,active,epoch_bad,eligible=paper_clock_core(clean,names,sats,cfg,availability=mapped)
+    combined=np.full(raw.shape[1:],np.nan);effective=np.zeros_like(raw);weights={};failed=[]
+    for sc,ci in core.items():
+        idx=np.array([i for i,s in enumerate(sats) if s[0]==sc]);ap=active[sc]
+        matrix=eligible[ap][:,ci].reshape(len(ap),-1)*C if len(ap) else np.empty((0,0))
+        matrix=matrix[:,np.all(np.isfinite(matrix),axis=0)]
+        sig,audit=paper_lsvce(matrix,int(cfg.get('vce_min_scalar_samples',100)),int(cfg.get('vce_max_iterations',100)),float(cfg.get('vce_relative_tol',1e-8)),cfg.get('vce_constraint','unconstrained'))
+        if len(ci)<int(cfg.get('core_min_satellites',3)):
+            sig=None;audit.update(converged=False,reason='INSUFFICIENT_CORE_SATELLITES')
+        z={'names':[names[p] for p in ap],'core_satellites':[sats[i] for i in ci],
+           'core_satellite_epochs':int(matrix.shape[1]),'core_full_coverage_satellite_epochs':int(len(ci)*len(times)),
+           'core_epoch_policy':'exclude a flagged satellite epoch jointly from every AC; no unequal per-AC VCE samples','estimation':audit,
+           'sigma2_m2':sig.tolist() if sig is not None else None,
+           'rejected_for_core':[sats[i] for i in idx if i not in set(ci)],
+           'epoch_outliers_for_core':int(epoch_bad[:,idx].sum())}
+        if sig is None:failed.append(sc)
+        else:
+            a,w=paper_inverse_variance_mean(aligned[ap][:,idx],sig)
+            combined[idx]=a
+            for local,p in enumerate(ap):effective[p,idx]=w[local]
+            _,bw=paper_inverse_variance_mean(np.zeros((len(sig),1)),sig)
+            z['normalized_base_weights']=bw[:,0].tolist()
+            z['final_clock_policy']='retain noncore satellites but not step-2 rejected records; normalize inverse variance over available ACs'
+        weights[sc]=z
+    diag['clock_weights']=weights
+    diag['workflow']=['radial_orbit_correction','300s_exact_clock_standardization_and_point_screen',
+                     'reference_AC_global_offset_drift','satellite_RMS_modified_Z_screen',
+                     'constellation_ISB_alignment','common_core_satellite_epoch_screen',
+                     'LSVCE_and_pure_inverse_variance_combination']
+    diag['status']='MATHEMATICAL_BASELINE_COMPLETE' if not failed else 'CLOCK_VCE_FAILED'
+    if not failed and cfg.get('vce_constraint')=='nonnegative':diag['status']='CONSTRAINED_LSVCE_PIPELINE_COMPLETE'
+    diag['boundary_systems']={'orbit':[s for s,z in orbit_audit.get('weights',{}).items() if z.get('estimation',{}).get('active_zero_indices')],
+                              'clock':[s for s,z in weights.items() if z.get('estimation',{}).get('active_zero_indices')]}
+    diag['failed_systems']=failed
+    diag['max_effective_weight_normalization_error']=float(np.max(np.abs(effective.sum(0)[np.isfinite(combined)]-1))) if np.isfinite(combined).any() else None
+    diag['satellite_RMS_before_ISB_m']={n:{s:float(sat_rms[p,i]) for i,s in enumerate(sats)} for p,n in enumerate(names)}
+    # Weights and metadata are written even on an estimator failure.
+    import csv
+    with open(os.path.join(out,'weights.csv'),'w',newline='',encoding='utf-8-sig') as f:
+        w=csv.writer(f);w.writerow(['system','AC','sigma2_m2','normalized_weight','core_satellites','scalar_samples','status'])
+        for sc,z in weights.items():
+            for p,n in enumerate(z['names']):w.writerow([sc,n,z['sigma2_m2'][p] if z['sigma2_m2'] else '',z.get('normalized_base_weights',['']*len(z['names']))[p],len(z['core_satellites']),z['estimation']['scalar_samples'],z['estimation']['reason']])
+    if failed and cfg.get('require_all_systems_success',True):
+        stop('CLOCK_VCE_FAILED','clock LSVCE failed for '+','.join(failed)+'; no silent equal-weight/variance-floor fallback; weights.csv written')
+    if not np.isfinite(combined).any():save();raise ValueError('no valid clock solution')
+    ref=product(refs[0]) if refs else None
+    if ref:
+        RX,RK,ra=paper_sample(ref,sats,times,cfg);sampling[ref.name]=ra
+        variants={'M0_'+n:raw[p] for p,n in enumerate(names)}
+        variants.update({'M1_equal_aligned':np.nanmean(aligned,axis=0),
+                         'M2_constrained_LSVCE' if cfg.get('vce_constraint')=='nonnegative' else 'M2_paper_LSVCE':combined})
+        shared=np.zeros_like(combined,dtype=bool)
+        for sc,ap in active.items():
+            idx=np.array([i for i,s in enumerate(sats) if s[0]==sc])
+            shared[idx]=np.isfinite(RK[idx])&np.all(np.isfinite(raw[ap][:,idx]),axis=0)&np.all(np.isfinite(aligned[ap][:,idx]),axis=0)&np.isfinite(combined[idx])
+        diag['ac_common_sample_comparison']={'reference':ref.name,'common_satellite_epochs':int(shared.sum()),
+             'definition':'same satellite epochs among participating AC schemes within each system; an AC lacking a system has no comparison samples; REF not used for calibration; per-system datum evaluation only',
+             'variants':{n:paper_clock_eval(np.where(shared,RK,np.nan),np.where(shared,k,np.nan),sats,interval) for n,k in variants.items()}}
+        diag['clock_evaluation_by_system_vs_ref']={'formal_full_support':paper_clock_eval(RK,combined,sats,interval)}
+        internal={n:paper_clock_eval(combined,aligned[p],sats,interval) for p,n in enumerate(names)}
+        diag['internal_consistency_vs_combination']=internal
+        diag['orbit_evaluation_vs_ref']=rtn_diagnostics(RX,common,times,np.ones(len(times),bool),float(cfg.get('orbit_error_sanity_limit_m',10)))
+        report['products'].append(ref.report())
+        with open(os.path.join(out,'clock_residuals.csv'),'w',newline='',encoding='utf-8-sig') as f:
+            w=csv.writer(f);w.writerow(['epoch_GPST','satellite','test_minus_REF_m','system_datum_removed_m','common_comparison_sample'])
+            D=(combined-RK)*C;center={}
+            for sc in core:
+                idx=np.array([i for i,s in enumerate(sats) if s[0]==sc]);v=np.nanmedian(D[idx],axis=0);v[np.isfinite(D[idx]).sum(0)<3]=np.nan;center[sc]=v
+            for j,t in enumerate(times):
+                for i,s in enumerate(sats):
+                    if np.isfinite(D[i,j]):w.writerow([iso_sec(t),s,D[i,j],D[i,j]-center[s[0]][j],int(shared[i,j])])
+    with open(os.path.join(out,'effective_weights.csv'),'w',newline='',encoding='utf-8-sig') as f:
+        w=csv.writer(f);w.writerow(['epoch_GPST','satellite','AC','available','effective_weight','core_satellite'])
+        for j,t in enumerate(times):
+            for i,s in enumerate(sats):
+                if not np.isfinite(combined[i,j]):continue
+                for p,n in enumerate(names):w.writerow([iso_sec(t),s,n,int(np.isfinite(aligned[p,i,j])),effective[p,i,j],int(i in set(core[s[0]]))])
+    frame=str(cfg.get('reference_frame','IGS20'))
+    declared={f for p in ac for f in p.frames}
+    if declared!={frame}:frame='MIXED';diag['frame_warning']='frame labels differ; do not infer absolute frame certification from residual fits'
+    report['outputs']=paper_write_products(out,common,combined,sats,times,frame,interval)
+    if cfg.get('vce_constraint')=='nonnegative':
+        report['outputs']['mode']='mansur_workflow_with_cited_nonnegative_LSVCE_extension'
+        for key in ['sp3','clk']:
+            p=report['outputs'][key]
+            with open(p,encoding='utf-8') as f:content=f.read()
+            label='NONNEGATIVE LSVCE EXTENSION; 2008 SECTION 3.6'
+            marker='/* '+label+'\n' if key=='sp3' else f'{label:<60}COMMENT\n'
+            if key=='sp3':content=content.replace('/* MANSUR 2024',marker+'/* MANSUR 2024',1)
+            else:content=content.replace('                                                            END OF HEADER',marker+'                                                            END OF HEADER',1)
+            with open(p,'w',newline='\n',encoding='utf-8') as f:f.write(content)
+    report['outputs'].update(quality=os.path.join(out,'quality.json'),weights=os.path.join(out,'weights.csv'),
+               residuals=os.path.join(out,'clock_residuals.csv') if ref else None)
+    diag['PPP_validation']='NOT_RUN; product comparisons do not certify positioning accuracy'
+    diag['replication_limitations']=['Different AC set/day from publication; numerical published values are not an acceptance target',
+           'Linear reference model can fail for nonlinear reference clocks; no adaptive correction is enabled',
+           'Paper does not fully specify screening/selection numerical settings; all choices exposed in config/report',
+           'Clock FDMA satellite constants are optional; inspect GLONASS residuals and document the choice']
+    save()
+    with open(os.path.join(out,'combined.log'),'w',encoding='utf-8') as f:json.dump(json_safe(report),f,indent=2,allow_nan=False)
+    print(json.dumps(report['outputs'],ensure_ascii=False,indent=2))
+    return {'orbit':common,'clock':combined,'sats':sats,'grid':times,'report':report,
+             'experiment_arrays':{'raw_clock':raw,'aligned_ac_clock':aligned,'ac_names':names,'effective_weights':effective}}
+
+
+def paper_equation_self_test():
+    """Compare reduced equations against independently assembled full model."""
+    if np is None:raise RuntimeError('NumPy is required')
+    rng=np.random.default_rng(37);R,n=4,24
+    basis,_=np.linalg.qr(rng.normal(size=(n,R)));expected=np.array([.01,.04,.09,.16])
+    V=(basis*np.sqrt(n*expected)).T
+    sig,audit=paper_lsvce(V,min_samples=1)
+    np.testing.assert_allclose(sig,expected,rtol=2e-12)
+    D=np.vstack([-np.ones((1,R-1)),np.eye(R-1)]);B=np.kron(D,np.eye(n))
+    Qt=B.T@np.kron(np.diag(sig),np.eye(n))@B;inv=np.linalg.inv(Qt);t=B.T@V.reshape(-1)
+    components=[B.T@np.kron(np.diag(np.eye(R)[i]),np.eye(n))@B for i in range(R)]
+    N=np.array([[.5*np.trace(a@inv@b@inv) for b in components] for a in components])
+    rhs=np.array([.5*t@inv@a@inv@t for a in components])
+    np.testing.assert_allclose(np.linalg.solve(N,rhs),sig,rtol=2e-12)
+    order=[2,0,3,1];permuted,_=paper_lsvce(V[order],min_samples=1)
+    np.testing.assert_allclose(permuted,sig[order],rtol=2e-12)
+    assert paper_lsvce(V[:2],min_samples=1)[0] is None
+    z=rng.normal(size=100);assert paper_lsvce(np.stack([z,z,-z]),min_samples=1)[0] is None
+    result,weights=paper_inverse_variance_mean(np.array([[[1.,np.nan]],[[3.,5.]],[[9.,11.]]]),np.array([1.,2.,4.]))
+    np.testing.assert_allclose(result,[[19./7,7.]]);np.testing.assert_allclose(weights.sum(0),1.)
+    constrained,proof=paper_nonnegative_normal(np.array([[2.,1.],[1.,2.]]),np.array([-1.,2.]))
+    np.testing.assert_allclose(constrained,[0.,1.])  # refit, not [0, 5/3] clipping
+    positive,_=paper_lsvce(V,min_samples=1,constraint='nonnegative')
+    np.testing.assert_allclose(positive,expected,rtol=2e-12)
+    S=np.array([[.002,-.001],[-.001,.003]])
+    boundary_values=np.vstack([np.zeros(2),np.linalg.cholesky(S)*np.sqrt(2)])
+    boundary,a=paper_lsvce(boundary_values,min_samples=1,constraint='nonnegative')
+    np.testing.assert_allclose(boundary,[0.,.002,.003],rtol=1e-12)
+    assert a['reason']=='CONVERGED_BOUNDARY'
+    result,w=paper_inverse_variance_mean(np.array([[2.,np.nan],[3.,5.],[9.,11.]]),[0.,2.,4.])
+    np.testing.assert_allclose(result,[2.,7.]);np.testing.assert_allclose(w.sum(0),1.)
+    print('PASS: Mansur reduced LSVCE matches dense Kronecker equations; reference invariant; no negative-variance clipping; pure inverse variance mean')
+    print('PASS: cited nonnegative extension refits components; positive solution preserved; boundary covariance and missing-source weight limits verified')
+
+
+def main(c):
+    """Explicitly separate paper baseline from retained experimental legacy."""
+    pipeline=c.get('pipeline','legacy_causal')
+    if pipeline=='mansur2024':return paper_baseline_main(c)
+    if pipeline=='legacy_causal':return legacy_main(c)
+    raise ValueError('pipeline must be mansur2024 or legacy_causal')
+
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("config",nargs="?")
+    ap.add_argument("--self-test",action="store_true",help="check reduced LSVCE against explicit Kronecker equations")
+    ap.add_argument("--diagnose",metavar="QUALITY_JSON",help="print exact system/AC failure evidence from an existing quality.json; no rerun or writes")
+    ap.add_argument("--replay-vce",metavar="QUALITY_JSON",help="replay saved orbit second moments through constrained VCE; no product generation")
+    args = ap.parse_args()
+    try:
+        if args.replay_vce:paper_replay_vce_file(args.replay_vce)
+        elif args.diagnose:paper_diagnose_file(args.diagnose)
+        elif args.self_test:paper_equation_self_test()
+        elif args.config:main(parse_config(args.config))
+        else:ap.error('provide CONFIG.json or --self-test')
+    except Exception as e:
+        print("ERROR:", e, file=sys.stderr)
+        sys.exit(2)
+
+{
+  "pipeline": "mansur2024",
+  "data_dir": "D:/bnc_Qrignal/BNC_yuanma/sp3",
+  "output_dir": "D:/bnc_Qrignal/BNC_yuanma/tools/mansur2024_clock_paper_reviewed",
+  "arc_start": "2025-01-01T00:00:00",
+  "arc_end": "2025-01-01T23:55:00",
+  "interval": 300,
+  "systems": [
+    "G",
+    "R",
+    "E",
+    "C"
+  ],
+  "include_b2b": false,
+  "strict_no_future_nodes": false,
+  "reference_system": "G",
+  "reference_ac": "auto_median_trend",
+  "reference_station_by_ac": {},
+  "reference_frame": "IGS20",
+  "combined_orbit_file": null,
+  "radial_ac_orbit_basis": "helmert_aligned",
+  "max_orbit_gap": 900,
+  "orbit_end_extrapolation_s": 300,
+  "radius_max_m_by_system": {
+    "G": 30000000,
+    "R": 30000000,
+    "E": 30000000,
+    "C": 45000000
+  },
+  "modified_z_threshold": 3.5,
+  "alignment_min_samples": 30,
+  "core_min_satellites": 3,
+  "vce_min_scalar_samples": 100,
+  "vce_constraint": "unconstrained",
+  "vce_max_iterations": 100,
+  "vce_relative_tol": 1e-08,
+  "orbit_rough_limit_m": 500,
+  "orbit_max_iterations": 30,
+  "orbit_frame_datum": "initial_mean",
+  "orbit_convergence_m": 0.001,
+  "orbit_z_threshold_by_system": {
+    "G": 3.5,
+    "R": 3.5,
+    "E": 3.5,
+    "C": 5.0
+  },
+  "glonass_satellite_isb": false,
+  "require_all_systems_success": true,
+  "products": [
+    {
+      "name": "COD",
+      "kind": "REF",
+      "sp3": "COD0MGXFIN_20250010000_01D_05M_ORB.SP3",
+      "clk": "COD0MGXFIN_20250010000_01D_30S_CLK.CLK"
+    },
+    {
+      "name": "IAC",
+      "kind": "AC",
+      "sp3": "IAC0MGXFIN_20250010000_01D_05M_ORB.SP3",
+      "clk": "IAC0MGXFIN_20250010000_01D_30S_CLK.CLK"
+    },
+    {
+      "name": "GBM",
+      "kind": "AC",
+      "sp3": "GBM0MGXRAP_20250010000_01D_05M_ORB.SP3",
+      "clk": "GBM0MGXRAP_20250010000_01D_30S_CLK.CLK"
+    },
+    {
+      "name": "WUM",
+      "kind": "AC",
+      "sp3": "WUM0MGXFIN_20250010000_01D_05M_ORB.SP3",
+      "clk": "WUM0MGXFIN_20250010000_01D_30S_CLK.CLK"
+    },
+    {
+      "name": "B2B",
+      "kind": "B2B",
+      "sp3": "b2b23473.sp3",
+      "clk": "b2b23473.clk"
+    }
+  ]
+}
